@@ -9,6 +9,10 @@ import sys
 import sqlite3
 import hashlib # Để tạo key ngẫu nhiên và an toàn hơn
 
+# Thêm import cho Flask và Thread
+from flask import Flask
+from threading import Thread
+
 # --- Cấu hình Bot và Admin ---
 # THAY THẾ BẰNG BOT_TOKEN CỦA BẠN (Lấy từ BotFather, KHÔNG PHẢI TOKEN MẪU)
 BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
@@ -17,6 +21,9 @@ ADMIN_IDS = [6915752059]
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- Cấu hình Game ---
+# LƯU Ý: Các URL API dưới đây vẫn là các URL cũ. 
+# Nếu các URL này không trả về định dạng JSON mới của bạn, 
+# bạn cần thay đổi chúng sang các API tương ứng.
 GAME_CONFIGS = {
     'luckywin': {'api_url': 'https://luckywin01.com/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Luckywin', 'history_table': 'luckywin_history'},
     'hitclub': {'api_url': 'https://apphit.club/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Hit Club', 'history_table': 'hitclub_history'},
@@ -259,7 +266,7 @@ def make_prediction_for_game(game_name):
 
     return prediction_text, predicted_value
 
-# --- Logic Xử lý Game ---
+# --- Logic Xử lý Game (ĐÃ SỬA ĐỔI ĐỂ ĐỌC ĐỊNH DẠNG JSON MỚI CỦA BẠN) ---
 def process_game_api_fetch(game_name, config):
     """Kết nối API, xử lý dữ liệu phiên mới, lưu vào DB."""
     url = config['api_url']
@@ -270,52 +277,68 @@ def process_game_api_fetch(game_name, config):
         response.raise_for_status()
         data = response.json()
 
-        if data and 'logs' in data and data['logs']:
-            latest_log = data['logs'][0]
-            phien = latest_log.get('phien')
-            result_points = latest_log.get('result_points')
-            dices = latest_log.get('dices')
+        # Giả định API trả về trực tiếp một đối tượng JSON với các khóa bạn cung cấp
+        # {"Ket_qua":"","Phien":0,"Tong":0,"Xuc_xac_1":0,"Xuc_xac_2":0,"Xuc_xac_3":0,"id":"djtuancon"}
+        
+        phien = data.get('Phien')
+        total_point = data.get('Tong')
+        dice1 = data.get('Xuc_xac_1')
+        dice2 = data.get('Xuc_xac_2')
+        dice3 = data.get('Xuc_xac_3')
+        # Lấy Ket_qua trực tiếp nếu có, nếu không thì tính toán
+        result_tx_from_api = data.get('Ket_qua', '').upper() 
 
-            if phien and phien > LAST_FETCHED_IDS[game_name]:
+        # Kiểm tra dữ liệu cần thiết
+        if phien is not None and total_point is not None and \
+           dice1 is not None and dice2 is not None and dice3 is not None:
+            
+            if phien > LAST_FETCHED_IDS[game_name]:
                 LAST_FETCHED_IDS[game_name] = phien
 
-                if result_points is not None and dices and len(dices) == 3:
-                    total_point = sum(dices)
-                    result_tx = 'T' if total_point >= 11 else 'X'
+                # Xác định result_tx. Ưu tiên Ket_qua từ API nếu hợp lệ, 
+                # nếu không thì tính toán từ tổng điểm và xúc xắc.
+                result_tx = ''
+                if result_tx_from_api in ['T', 'X', 'B']:
+                    result_tx = result_tx_from_api
+                else:
+                    # Tạo lại list dices để kiểm tra bão (nếu cần)
+                    dices = [dice1, dice2, dice3] 
                     if dices[0] == dices[1] == dices[2]:
                         result_tx = 'B'
+                    elif total_point >= 11:
+                        result_tx = 'T'
+                    else:
+                        result_tx = 'X'
 
-                    save_game_result(game_name, phien, result_tx, total_point, dices[0], dices[1], dices[2])
-                    classify_and_learn_cau(game_name)
+                save_game_result(game_name, phien, result_tx, total_point, dice1, dice2, dice3)
+                classify_and_learn_cau(game_name)
 
-                    # Gửi thông báo kết quả phiên mới và dự đoán cho phiên tiếp theo đến Admin
-                    prediction_message_part, _ = make_prediction_for_game(game_name)
+                # Gửi thông báo kết quả phiên mới và dự đoán cho phiên tiếp theo đến Admin
+                prediction_message_part, _ = make_prediction_for_game(game_name)
+                
+                full_message = f"🔔 **{game_name_vi} - Phiên mới kết thúc!**\n\n"
+                full_message += prediction_message_part # Phần dự đoán
+                full_message += f"\n⚡ **Kết quả phiên {phien}**: "
+                full_message += f"[{dice1}] + [{dice2}] + [{dice3}] = **{total_point}** ({result_tx})"
+                
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, full_message, parse_mode='Markdown')
+                    except telebot.apihelper.ApiTelegramException as e:
+                        print(f"LỖI: Không thể gửi tin nhắn đến admin {admin_id}: {e}")
                     
-                    full_message = f"🔔 **{game_name_vi} - Phiên mới kết thúc!**\n\n"
-                    full_message += prediction_message_part # Phần dự đoán
-                    full_message += f"\n⚡ **Kết quả phiên {phien}**: "
-                    for i, dice in enumerate(dices):
-                        full_message += f"[{dice}] "
-                        if i < 2: full_message += "+ "
-                    full_message += f"= **{total_point}** ({result_tx})"
-                    
-                    for admin_id in ADMIN_IDS:
-                        try:
-                            bot.send_message(admin_id, full_message, parse_mode='Markdown')
-                        except telebot.apihelper.ApiTelegramException as e:
-                            print(f"LỖI: Không thể gửi tin nhắn đến admin {admin_id}: {e}")
-                        
-                    print(f"DEBUG: Đã xử lý và gửi thông báo cho {game_name_vi} phiên {phien}.")
-                    sys.stdout.flush()
-                else:
-                    print(f"LỖI: Thiếu dữ liệu result_points hoặc dices từ API {game_name_vi} cho phiên {phien}.")
-                    sys.stdout.flush()
+                print(f"DEBUG: Đã xử lý và gửi thông báo cho {game_name_vi} phiên {phien}.")
+                sys.stdout.flush()
+            # else: Phiên này đã được xử lý hoặc là phiên cũ hơn, không làm gì.
+        else:
+            print(f"LỖI: Thiếu dữ liệu (Phien, Tong, Xuc_xac_1/2/3) từ API {game_name_vi} cho dữ liệu: {data}")
+            sys.stdout.flush()
 
     except requests.exceptions.RequestException as e:
         print(f"LỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
         sys.stdout.flush()
     except json.JSONDecodeError as e:
-        print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}")
+        print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}. Dữ liệu nhận được không phải JSON hợp lệ hoặc không đúng định dạng mong muốn.")
         sys.stdout.flush()
     except Exception as e:
         print(f"LỖI: Xảy ra lỗi không xác định khi xử lý {game_name_vi}: {e}")
@@ -327,6 +350,22 @@ def check_apis_loop():
         for game_name, config in GAME_CONFIGS.items():
             process_game_api_fetch(game_name, config)
         time.sleep(CHECK_INTERVAL_SECONDS)
+
+# --- Keep-alive cho Render (SỬA ĐỔI MỚI) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """Endpoint cho Render Health Check."""
+    return "Bot is running!", 200
+
+def run_web_server():
+    """Chạy Flask web server trong một luồng riêng."""
+    # Lấy cổng từ biến môi trường của Render
+    port = int(os.environ.get('PORT', 5000))
+    print(f"DEBUG: Starting Flask web server on port {port}")
+    sys.stdout.flush()
+    app.run(host='0.0.0.0', port=port)
 
 # --- Quản lý Key Truy Cập ---
 def generate_key(length_days):
@@ -898,11 +937,19 @@ def start_bot_threads():
     init_db()
     load_cau_patterns_from_db()
 
+    # Khởi tạo luồng web server cho Render (keep-alive)
+    web_server_thread = Thread(target=run_web_server)
+    web_server_thread.daemon = True # Đặt daemon thread để nó tự kết thúc khi chương trình chính kết thúc
+    web_server_thread.start()
+    print("DEBUG: Đã khởi động luồng web server.")
+    sys.stdout.flush()
+
     # Khởi tạo luồng kiểm tra API
-    # Hàm check_apis_loop đã được định nghĩa ở trên
     api_checker_thread = threading.Thread(target=check_apis_loop) 
     api_checker_thread.daemon = True # Đặt daemon thread để nó tự kết thúc khi chương trình chính kết thúc
     api_checker_thread.start()
+    print("DEBUG: Đã khởi động luồng kiểm tra API.")
+    sys.stdout.flush()
 
     # Bắt đầu bot lắng nghe tin nhắn
     print("Bot đang khởi động và sẵn sàng nhận lệnh...")
