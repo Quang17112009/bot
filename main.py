@@ -10,10 +10,10 @@ import sqlite3
 import hashlib # Để tạo key ngẫu nhiên và an toàn hơn
 
 # --- Cấu hình Bot và Admin ---
-# THAY THẾ BẰNG BOT_TOKEN CỦA BẠN
+# THAY THẾ BẰNG BOT_TOKEN CỦA BẠN (Lấy từ BotFather, KHÔNG PHẢI TOKEN MẪU)
 BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
-# THAY THẾ BẰNG ID TELEGRAM CỦA BẠN
-ADMIN_IDS = [6915752059]
+# THAY THAY BẰNG ID TELEGRAM CỦA BẠN (VD: [123456789])
+ADMIN_IDS = [6915752059] 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- Cấu hình Game ---
@@ -309,7 +309,7 @@ def process_game(game_name, config):
                     sys.stdout.flush()
 
     except requests.exceptions.RequestException as e:
-        print(f"LỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
+        print(f"LỖỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
         sys.stdout.flush()
     except json.JSONDecodeError as e:
         print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}")
@@ -621,6 +621,7 @@ def get_game_history(message):
         return
 
     game_input = args[1].lower()
+    limit_str = args[2] # Lấy limit_str từ đây
     
     matched_game_key = None
     for key, config in GAME_CONFIGS.items():
