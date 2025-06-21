@@ -79,7 +79,7 @@ def init_db():
         cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS {config['history_table']} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phien INTEGER UNIQUE NOT NULL,
+                phien TEXT UNIQUE NOT NULL, -- Thay đổi thành TEXT để lưu Expect string
                 result_tx TEXT NOT NULL,
                 total_point INTEGER NOT NULL,
                 dice1 INTEGER NOT NULL,
@@ -175,7 +175,10 @@ def get_recent_history_tx(game_name, limit=RECENT_HISTORY_FETCH_LIMIT):
     """Lấy N ký tự 'T', 'X', 'B' của các phiên gần nhất từ database, theo thứ tự cũ đến mới."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(f"SELECT result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY phien DESC LIMIT ?", (limit,))
+    # Order by phien DESC because phien can be string (for Luckywin 'Expect' field)
+    # This might not give perfectly sequential results if 'Expect' strings don't sort numerically,
+    # but for recent history, it should generally work by ordering the latest strings.
+    cursor.execute(f"SELECT result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
     history = [row[0] for row in cursor.fetchall()]
     conn.close()
     return history[::-1] # Đảo ngược để có thứ tự từ cũ đến mới
@@ -291,22 +294,58 @@ def process_game_api_fetch(game_name, config):
         response.raise_for_status() # Sẽ raise HTTPError cho các mã lỗi 4xx/5xx
         data = response.json()
 
-        # Giả định API trả về trực tiếp một đối tượng JSON với các khóa bạn cung cấp
-        # {"Ket_qua":"","Phien":0,"Tong":0,"Xuc_xac_1":0,"Xuc_xac_2":0,"Xuc_xac_3":0,"id":"djtuancon"}
-        
-        phien = data.get('Phien')
-        total_point = data.get('Tong')
-        dice1 = data.get('Xuc_xac_1')
-        dice2 = data.get('Xuc_xac_2')
-        dice3 = data.get('Xuc_xac_3')
-        # Lấy Ket_qua trực tiếp nếu có, nếu không thì tính toán
-        result_tx_from_api = data.get('Ket_qua', '').upper() 
+        phien = None
+        total_point = None
+        dice1 = None
+        dice2 = None
+        dice3 = None
+        result_tx_from_api = ''
 
+        if game_name == 'luckywin':
+            # Specific parsing for Luckywin API response
+            if data.get('state') == 1 and 'data' in data:
+                game_data = data['data']
+                phien = game_data.get('Expect') # This is the "Phien" for Luckywin
+                open_code = game_data.get('OpenCode')
+                
+                if open_code:
+                    try:
+                        dices_str = open_code.split(',')
+                        if len(dices_str) == 3:
+                            dice1 = int(dices_str[0])
+                            dice2 = int(dices_str[1])
+                            dice3 = int(dices_str[2])
+                            total_point = dice1 + dice2 + dice3
+                    except ValueError:
+                        print(f"LỖI: OpenCode '{open_code}' không hợp lệ cho Luckywin.")
+                        sys.stdout.flush()
+                        return
+            else:
+                print(f"LỖI: Dữ liệu Luckywin không đúng định dạng mong đợi: {data}")
+                sys.stdout.flush()
+                return
+
+        elif game_name in ['hitclub', 'sunwin']:
+            # Parsing for Hitclub and Sunwin API response
+            phien = data.get('Phien')
+            total_point = data.get('Tong')
+            dice1 = data.get('Xuc_xac_1')
+            dice2 = data.get('Xuc_xac_2')
+            dice3 = data.get('Xuc_xac_3')
+            result_tx_from_api = data.get('Ket_qua', '').upper() 
+        
         # Kiểm tra dữ liệu cần thiết
         if phien is not None and total_point is not None and \
            dice1 is not None and dice2 is not None and dice3 is not None:
             
-            if phien > LAST_FETCHED_IDS[game_name]:
+            # For Luckywin, LAST_FETCHED_IDS will store the 'Expect' string.
+            # For Hitclub/Sunwin, it will store the 'Phien' integer.
+            # This comparison needs to be careful if phien is string vs int.
+            # A simple comparison like phien > LAST_FETCHED_IDS[game_name] works
+            # for integers. For strings, it compares lexicographically. 
+            # If Luckywin 'Expect' is strictly sequential like "2506211333", then
+            # lexicographical comparison should also work to detect new sessions.
+            if phien != LAST_FETCHED_IDS[game_name]: # Using != for string comparison
                 LAST_FETCHED_IDS[game_name] = phien
 
                 # Xác định result_tx. Ưu tiên Ket_qua từ API nếu hợp lệ, 
@@ -712,7 +751,8 @@ def get_game_history(message):
     cursor = conn.cursor()
     
     try:
-        cursor.execute(f"SELECT phien, total_point, result_tx, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} ORDER BY phien DESC LIMIT ?", (limit,))
+        # Order by id DESC as phien can be string (for Luckywin 'Expect' field)
+        cursor.execute(f"SELECT phien, total_point, result_tx, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
         history_records = cursor.fetchall()
         conn.close()
 
