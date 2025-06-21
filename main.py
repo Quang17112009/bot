@@ -260,8 +260,8 @@ def make_prediction_for_game(game_name):
     return prediction_text, predicted_value
 
 # --- Logic Xử lý Game ---
-def process_game(game_name, config):
-    """Kết nối API, xử lý dữ liệu phiên mới, lưu vào DB và gửi dự đoán."""
+def process_game_api_fetch(game_name, config):
+    """Kết nối API, xử lý dữ liệu phiên mới, lưu vào DB."""
     url = config['api_url']
     game_name_vi = config['game_name_vi']
 
@@ -300,7 +300,10 @@ def process_game(game_name, config):
                     full_message += f"= **{total_point}** ({result_tx})"
                     
                     for admin_id in ADMIN_IDS:
-                        bot.send_message(admin_id, full_message, parse_mode='Markdown')
+                        try:
+                            bot.send_message(admin_id, full_message, parse_mode='Markdown')
+                        except telebot.apihelper.ApiTelegramException as e:
+                            print(f"LỖI: Không thể gửi tin nhắn đến admin {admin_id}: {e}")
                         
                     print(f"DEBUG: Đã xử lý và gửi thông báo cho {game_name_vi} phiên {phien}.")
                     sys.stdout.flush()
@@ -309,7 +312,7 @@ def process_game(game_name, config):
                     sys.stdout.flush()
 
     except requests.exceptions.RequestException as e:
-        print(f"LỖỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
+        print(f"LỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
         sys.stdout.flush()
     except json.JSONDecodeError as e:
         print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}")
@@ -317,6 +320,13 @@ def process_game(game_name, config):
     except Exception as e:
         print(f"LỖI: Xảy ra lỗi không xác định khi xử lý {game_name_vi}: {e}")
         sys.stdout.flush()
+
+def check_apis_loop():
+    """Vòng lặp liên tục kiểm tra API của các game."""
+    while True:
+        for game_name, config in GAME_CONFIGS.items():
+            process_game_api_fetch(game_name, config)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 # --- Quản lý Key Truy Cập ---
 def generate_key(length_days):
@@ -621,7 +631,7 @@ def get_game_history(message):
         return
 
     game_input = args[1].lower()
-    limit_str = args[2] # Lấy limit_str từ đây
+    limit_str = args[2] 
     
     matched_game_key = None
     for key, config in GAME_CONFIGS.items():
@@ -889,7 +899,8 @@ def start_bot_threads():
     load_cau_patterns_from_db()
 
     # Khởi tạo luồng kiểm tra API
-    api_checker_thread = threading.Thread(target=check_apis_loop)
+    # Hàm check_apis_loop đã được định nghĩa ở trên
+    api_checker_thread = threading.Thread(target=check_apis_loop) 
     api_checker_thread.daemon = True # Đặt daemon thread để nó tự kết thúc khi chương trình chính kết thúc
     api_checker_thread.start()
 
