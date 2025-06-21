@@ -1,1510 +1,652 @@
 import telebot
 import requests
-import time
 import json
+import time
+import threading
+from datetime import datetime
 import os
-import random
-import string
-import sys # Import sys for stdout.flush for immediate log output
-from datetime import datetime, timedelta
-from threading import Thread, Event, Lock
-from flask import Flask, request
+import sys
+import sqlite3
 
-# --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠI ĐÂY) ---
-BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
-ADMIN_IDS = [6915752059] # Ví dụ: [6915752059, 123456789]
-
-DATA_FILE = 'user_data.json'
-CAU_PATTERNS_FILE = 'cau_patterns.json'
-CODES_FILE = 'codes.json'
-BOT_STATUS_FILE = 'bot_status.json' # File để lưu trạng thái bot
-
-# --- Khởi tạo Flask App và Telegram Bot ---
-app = Flask(__name__)
+# --- Cấu hình Bot và Admin ---
+# THAY THẾ BẰNG BOT_TOKEN CỦA BẠN
+BOT_TOKEN = "7820739987:AAE-eU2JPZH7u6KnDRq31_l4tn64AD_8f6s"
+# THAY THẾ BẰNG ID TELEGRAM CỦA BẠN
+ADMIN_IDS = [6915752059]
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Global flags và objects
-bot_enabled = True
-bot_disable_reason = "Không có"
-bot_disable_admin_id = None
-prediction_stop_events = {} # Dictionary of Events for each game's prediction thread
-bot_initialized = False # Cờ để đảm bảo bot chỉ được khởi tạo một lần
-bot_init_lock = Lock() # Khóa để tránh race condition khi khởi tạo
-
-# Global sets for patterns and codes
-# Mẫu cầu sẽ được lưu theo từng game
-CAU_DEP = {} # {'luckywin': set(), 'hitclub': set(), 'sunwin': set()}
-CAU_XAU = {} # {'luckywin': set(), 'hitclub': set(), 'sunwin': set()}
-GENERATED_CODES = {} # {code: {"value": 1, "type": "day", "used_by": null, "used_time": null}}
-
-# Game specific configurations
+# --- Cấu hình Game ---
 GAME_CONFIGS = {
-    'luckywin': {
-        'api_url': "https://1.bot/GetNewLottery/LT_Taixiu",
-        'prediction_enabled': True,
-        'maintenance_mode': False,
-        'maintenance_reason': "",
-        'game_name_vi': "Luckywin",
-        'prediction_stats': {'correct': 0, 'wrong': 0, 'total': 0},
-        'users_receiving': set() # Users currently receiving predictions for this game
-    },
-    'hitclub': {
-        'api_url': "https://apihitclub.up.railway.app/api/taixiu",
-        'prediction_enabled': True,
-        'maintenance_mode': False,
-        'maintenance_reason': "",
-        'game_name_vi': "Hit Club",
-        'prediction_stats': {'correct': 0, 'wrong': 0, 'total': 0},
-        'users_receiving': set()
-    },
-    'sunwin': {
-        'api_url': "https://wanglinapiws.up.railway.app/api/taixiu",
-        'prediction_enabled': True,
-        'maintenance_mode': False,
-        'maintenance_reason': "",
-        'game_name_vi': "Sunwin",
-        'prediction_stats': {'correct': 0, 'wrong': 0, 'total': 0},
-        'users_receiving': set()
-    }
+    'luckywin': {'api_url': 'https://luckywin01.com/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Luckywin', 'history_table': 'luckywin_history'},
+    'hitclub': {'api_url': 'https://apphit.club/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Hit Club', 'history_table': 'hitclub_history'},
+    'sunwin': {'api_url': 'https://sunwin.ist/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Sunwin', 'history_table': 'sunwin_history'}
 }
 
-# --- Quản lý dữ liệu người dùng, mẫu cầu và code ---
-user_data = {} # {user_id: {username, expiry_date, is_ctv, banned, ban_reason, override_maintenance, receiving_games: {'luckywin': True, 'hitclub': True, 'sunwin': True}}}
+# --- Biến Toàn Cục và Cấu Hình Lưu Trữ ---
+LAST_FETCHED_IDS = {game: 0 for game in GAME_CONFIGS.keys()}
+CHECK_INTERVAL_SECONDS = 5 # Kiểm tra API mỗi 5 giây
+CAU_DEP = {game: set() for game in GAME_CONFIGS.keys()}
+CAU_XAU = {game: set() for game in GAME_CONFIGS.keys()}
+CAU_MIN_LENGTH = 5 # Độ dài tối thiểu của mẫu cầu để phân loại
+RECENT_HISTORY_FETCH_LIMIT = 50 # Số phiên lịch sử gần nhất để lấy từ DB phục vụ việc học mẫu cầu
 
-def load_json_file(filepath, default_value):
-    if os.path.exists(filepath):
-        with open(filepath, 'r', encoding='utf-8') as f:
-            try:
-                data = json.load(f)
-                print(f"DEBUG: Tải {len(data)} bản ghi từ {filepath}")
-                return data
-            except json.JSONDecodeError:
-                print(f"LỖI: Lỗi đọc {filepath}. Khởi tạo lại dữ liệu.")
-                return default_value
-            except Exception as e:
-                print(f"LỖI: Lỗi không xác định khi tải {filepath}: {e}")
-                return default_value
-    else:
-        print(f"DEBUG: File {filepath} không tồn tại. Khởi tạo dữ liệu rỗng.")
-        return default_value
+TEMP_DIR = 'temp_bot_files' # Thư mục để lưu file tạm thời
+DB_NAME = 'bot_data.db' # Tên file database SQLite
 
-def save_json_file(filepath, data):
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"LỖI: Không thể lưu dữ liệu vào {filepath}: {e}")
-    sys.stdout.flush()
+# Tạo thư mục nếu chưa tồn tại
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
 
-def load_user_data():
-    global user_data
-    user_data = load_json_file(DATA_FILE, {})
-    # Đảm bảo các trường mới tồn tại trong user_data cũ
-    for user_id_str, u_data in user_data.items():
-        u_data.setdefault('banned', False)
-        u_data.setdefault('ban_reason', None)
-        u_data.setdefault('override_maintenance', False)
-        # Khởi tạo receiving_games nếu chưa có
-        u_data.setdefault('receiving_games', {game: True for game in GAME_CONFIGS.keys()})
-        # Cập nhật users_receiving set trong GAME_CONFIGS
-        for game_name, config in GAME_CONFIGS.items():
-            if u_data['receiving_games'].get(game_name, False) and not u_data['banned']:
-                config['users_receiving'].add(int(user_id_str))
-    save_user_data(user_data) # Lưu lại để cập nhật schema
+# Biến tạm để lưu trạng thái chờ file của admin (cho lệnh /nhapcau)
+waiting_for_cau_file = {} # {admin_id: True}
 
-def save_user_data(data):
-    save_json_file(DATA_FILE, data)
-
-def load_cau_patterns():
-    global CAU_DEP, CAU_XAU
-    loaded_patterns = load_json_file(CAU_PATTERNS_FILE, {})
-    for game_name in GAME_CONFIGS.keys():
-        CAU_DEP[game_name] = set(loaded_patterns.get(game_name, {}).get('dep', []))
-        CAU_XAU[game_name] = set(loaded_patterns.get(game_name, {}).get('xau', []))
-        print(f"DEBUG: Tải {len(CAU_DEP[game_name])} mẫu cầu đẹp và {len(CAU_XAU[game_name])} mẫu cầu xấu cho {game_name}.")
-    sys.stdout.flush()
-
-def save_cau_patterns():
-    patterns_to_save = {}
-    for game_name in GAME_CONFIGS.keys():
-        patterns_to_save[game_name] = {
-            'dep': list(CAU_DEP.get(game_name, set())),
-            'xau': list(CAU_XAU.get(game_name, set()))
-        }
-    save_json_file(CAU_PATTERNS_FILE, patterns_to_save)
-
-def load_codes():
-    global GENERATED_CODES
-    GENERATED_CODES = load_json_file(CODES_FILE, {})
-
-def save_codes():
-    save_json_file(CODES_FILE, GENERATED_CODES)
-
-def load_bot_status():
-    global bot_enabled, bot_disable_reason, bot_disable_admin_id, GAME_CONFIGS
-    status = load_json_file(BOT_STATUS_FILE, {})
-    bot_enabled = status.get('bot_enabled', True)
-    bot_disable_reason = status.get('bot_disable_reason', "Không có")
-    bot_disable_admin_id = status.get('bot_disable_admin_id')
-
-    for game_name, config in GAME_CONFIGS.items():
-        game_status = status.get('game_configs', {}).get(game_name, {})
-        config['prediction_enabled'] = game_status.get('prediction_enabled', True)
-        config['maintenance_mode'] = game_status.get('maintenance_mode', False)
-        config['maintenance_reason'] = game_status.get('maintenance_reason', "")
-        config['prediction_stats'] = game_status.get('prediction_stats', {'correct': 0, 'wrong': 0, 'total': 0})
-    print("DEBUG: Tải trạng thái bot và game.")
-    sys.stdout.flush()
-
-def save_bot_status():
-    status = {
-        'bot_enabled': bot_enabled,
-        'bot_disable_reason': bot_disable_reason,
-        'bot_disable_admin_id': bot_disable_admin_id,
-        'game_configs': {}
-    }
-    for game_name, config in GAME_CONFIGS.items():
-        status['game_configs'][game_name] = {
-            'prediction_enabled': config['prediction_enabled'],
-            'maintenance_mode': config['maintenance_mode'],
-            'maintenance_reason': config['maintenance_reason'],
-            'prediction_stats': config['prediction_stats']
-        }
-    save_json_file(BOT_STATUS_FILE, status)
-    print("DEBUG: Lưu trạng thái bot và game.")
-    sys.stdout.flush()
-
+# --- Hàm Hỗ Trợ Chung ---
 def is_admin(user_id):
+    """Kiểm tra xem user_id có phải là admin hay không."""
     return user_id in ADMIN_IDS
 
-def is_ctv(user_id):
-    return is_admin(user_id) or (str(user_id) in user_data and user_data[str(user_id)].get('is_ctv'))
+def get_db_connection():
+    """Tạo và trả về kết nối đến cơ sở dữ liệu SQLite."""
+    conn = sqlite3.connect(DB_NAME)
+    return conn
 
-def is_banned(user_id):
-    return str(user_id) in user_data and user_data[str(user_id)].get('banned', False)
+def init_db():
+    """Khởi tạo các bảng cần thiết trong cơ sở dữ liệu nếu chúng chưa tồn tại."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-def can_override_maintenance(user_id):
-    return is_admin(user_id) or (str(user_id) in user_data and user_data[str(user_id)].get('override_maintenance', False))
+    # Tạo bảng mẫu cầu
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS cau_patterns (
+            game_name TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            type TEXT NOT NULL, -- 'dep' or 'xau'
+            PRIMARY KEY (game_name, pattern, type)
+        )
+    ''')
 
-def check_subscription(user_id):
-    user_id_str = str(user_id)
-    if is_banned(user_id):
-        return False, f"🚫 Bạn đã bị cấm sử dụng bot. Lý do: `{user_data[user_id_str].get('ban_reason', 'Không rõ')}`"
+    # Tạo bảng lịch sử cho mỗi game
+    for game_name, config in GAME_CONFIGS.items():
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS {config['history_table']} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, -- Tự động tăng ID
+                phien INTEGER UNIQUE NOT NULL, -- Số phiên, đảm bảo duy nhất
+                result_tx TEXT NOT NULL, -- T, X, B
+                total_point INTEGER NOT NULL,
+                dice1 INTEGER NOT NULL,
+                dice2 INTEGER NOT NULL,
+                dice3 INTEGER NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+        ''')
+    conn.commit()
+    conn.close()
 
-    if is_admin(user_id) or is_ctv(user_id):
-        return True, "Bạn là Admin/CTV, quyền truy cập vĩnh viễn."
+# --- Quản lý Mẫu Cầu (Sử dụng SQLite) ---
+def load_cau_patterns_from_db():
+    """Tải tất cả mẫu cầu từ database vào biến toàn cục CAU_DEP và CAU_XAU."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    for game_name in GAME_CONFIGS.keys():
+        CAU_DEP[game_name].clear()
+        CAU_XAU[game_name].clear()
 
-    if user_id_str not in user_data or user_data[user_id_str].get('expiry_date') is None:
-        return False, "⚠️ Bạn chưa đăng ký hoặc tài khoản chưa được gia hạn."
-
-    expiry_date_str = user_data[user_id_str]['expiry_date']
-    expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d %H:%M:%S')
-
-    if datetime.now() < expiry_date:
-        remaining_time = expiry_date - datetime.now()
-        days = remaining_time.days
-        hours = remaining_time.seconds // 3600
-        minutes = (remaining_time.seconds % 3600) // 60
-        seconds = remaining_time.seconds % 60
-        return True, f"✅ Tài khoản của bạn còn hạn đến: `{expiry_date_str}` ({days} ngày {hours} giờ {minutes} phút {seconds} giây)."
-    else:
-        return False, "❌ Tài khoản của bạn đã hết hạn."
-
-# --- Logic dự đoán Tài Xỉu ---
-def du_doan_theo_xi_ngau(dice_list):
-    if not dice_list:
-        return "Đợi thêm dữ liệu"
-    d1, d2, d3 = dice_list[-1]
-    total = d1 + d2 + d3
-
-    # Logic dự đoán dựa trên tổng và từng con xúc xắc
-    # Đây là một ví dụ, có thể phức tạp hơn
-    if total <= 10: # Xỉu
-        if sum([d for d in dice_list[-1] if d % 2 == 0]) >= sum([d for d in dice_list[-1] if d % 2 != 0]):
-            return "Tài"
-        else:
-            return "Xỉu"
-    else: # Tài
-        if sum([d for d in dice_list[-1] if d % 2 != 0]) >= sum([d for d in dice_list[-1] if d % 2 == 0]):
-            return "Xỉu"
-        else:
-            return "Tài"
-
-def tinh_tai_xiu(dice):
-    total = sum(dice)
-    if total == 3 or total == 18:
-        return "Bão", total # Bão 3 hoặc Bão 18
-    return "Tài" if total >= 11 else "Xỉu", total
-
-# --- Cập nhật mẫu cầu động ---
-def update_cau_patterns(game_name, new_cau, prediction_correct):
-    global CAU_DEP, CAU_XAU
-    if prediction_correct:
-        CAU_DEP.setdefault(game_name, set()).add(new_cau)
-        if new_cau in CAU_XAU.setdefault(game_name, set()):
-            CAU_XAU[game_name].remove(new_cau)
-            print(f"DEBUG: Xóa mẫu cầu '{new_cau}' khỏi cầu xấu cho {game_name}.")
-    else:
-        CAU_XAU.setdefault(game_name, set()).add(new_cau)
-        if new_cau in CAU_DEP.setdefault(game_name, set()):
-            CAU_DEP[game_name].remove(new_cau)
-            print(f"DEBUG: Xóa mẫu cầu '{new_cau}' khỏi cầu đẹp cho {game_name}.")
-    save_cau_patterns()
+        cursor.execute("SELECT pattern FROM cau_patterns WHERE game_name = ? AND type = 'dep'", (game_name,))
+        for row in cursor.fetchall():
+            CAU_DEP[game_name].add(row[0])
+        
+        cursor.execute("SELECT pattern FROM cau_patterns WHERE game_name = ? AND type = 'xau'", (game_name,))
+        for row in cursor.fetchall():
+            CAU_XAU[game_name].add(row[0])
+            
+    conn.close()
+    print(f"DEBUG: Đã tải mẫu cầu từ DB. Tổng cầu đẹp: {sum(len(v) for v in CAU_DEP.values())}, Tổng cầu xấu: {sum(len(v) for v in CAU_XAU.values())}")
     sys.stdout.flush()
 
-def is_cau_xau(game_name, cau_str):
-    return cau_str in CAU_XAU.get(game_name, set())
+def save_cau_patterns_to_db():
+    """Lưu tất cả mẫu cầu từ biến toàn cục CAU_DEP và CAU_XAU vào database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Xóa tất cả mẫu cũ để tránh trùng lặp và cập nhật lại
+    cursor.execute("DELETE FROM cau_patterns")
 
-def is_cau_dep(game_name, cau_str):
-    return cau_str in CAU_DEP.get(game_name, set()) and cau_str not in CAU_XAU.get(game_name, set()) # Đảm bảo không trùng cầu xấu
+    # Thêm mẫu cầu đẹp
+    for game_name, patterns in CAU_DEP.items():
+        if patterns: # Chỉ chèn nếu có mẫu
+            data = [(game_name, pattern, 'dep') for pattern in patterns]
+            cursor.executemany("INSERT INTO cau_patterns (game_name, pattern, type) VALUES (?, ?, ?)", data)
+    
+    # Thêm mẫu cầu xấu
+    for game_name, patterns in CAU_XAU.items():
+        if patterns: # Chỉ chèn nếu có mẫu
+            data = [(game_name, pattern, 'xau') for pattern in patterns]
+            cursor.executemany("INSERT INTO cau_patterns (game_name, pattern, type) VALUES (?, ?, ?)", data)
+            
+    conn.commit()
+    conn.close()
+    # print("DEBUG: Đã lưu mẫu cầu vào DB.") # Có thể bỏ dòng này để tránh spam log nếu gọi thường xuyên
+    # sys.stdout.flush()
 
-# --- Lấy dữ liệu từ API ---
-def lay_du_lieu(game_name):
-    config = GAME_CONFIGS[game_name]
+# --- Lịch sử Phiên Game (Sử dụng SQLite) ---
+def save_game_result(game_name, phien, result_tx, total_point, dice1, dice2, dice3):
+    """Lưu kết quả của một phiên game vào bảng lịch sử tương ứng trong database."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    try:
+        # INSERT OR IGNORE: Nếu phien đã tồn tại (do UNIQUE), bỏ qua.
+        cursor.execute(f'''
+            INSERT OR IGNORE INTO {GAME_CONFIGS[game_name]['history_table']} 
+            (phien, result_tx, total_point, dice1, dice2, dice3, timestamp) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (phien, result_tx, total_point, dice1, dice2, dice3, timestamp))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Phiên đã tồn tại, không làm gì cả
+        pass
+    except Exception as e:
+        print(f"LỖI: Không thể lưu kết quả phiên {phien} cho {game_name} vào DB: {e}")
+        sys.stdout.flush()
+    finally:
+        conn.close()
+
+def get_recent_history_tx(game_name, limit=RECENT_HISTORY_FETCH_LIMIT):
+    """Lấy N ký tự 'T', 'X', 'B' của các phiên gần nhất từ database, theo thứ tự cũ đến mới."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY phien DESC LIMIT ?", (limit,))
+    history = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return history[::-1] # Đảo ngược để có thứ tự từ cũ đến mới
+
+# --- Logic Học và Dự Đoán ---
+def classify_and_learn_cau(game_name):
+    """
+    Học các mẫu cầu 'đẹp' hoặc 'xấu' dựa trên lịch sử phiên và lưu vào database.
+    Mẫu cầu được xem xét là chuỗi CAU_MIN_LENGTH ký tự ('T', 'X', 'B').
+    """
+    recent_history_tx = get_recent_history_tx(game_name, limit=RECENT_HISTORY_FETCH_LIMIT)
+    
+    if len(recent_history_tx) < CAU_MIN_LENGTH + 1: # Cần ít nhất CAU_MIN_LENGTH + 1 phiên để có 1 mẫu và 1 kết quả
+        return 
+    
+    # Lặp qua lịch sử để tạo và phân loại các mẫu cầu
+    # Mỗi mẫu cầu có độ dài CAU_MIN_LENGTH
+    for i in range(len(recent_history_tx) - CAU_MIN_LENGTH):
+        pattern_to_classify = "".join(recent_history_tx[i : i + CAU_MIN_LENGTH])
+        actual_result_for_pattern = recent_history_tx[i + CAU_MIN_LENGTH]
+
+        # Xác định xem mẫu cầu có phải là cầu bệt hay zíc-zắc hay không
+        is_bet = (pattern_to_classify.count('T') == CAU_MIN_LENGTH) or \
+                 (pattern_to_classify.count('X') == CAU_MIN_LENGTH) or \
+                 (pattern_to_classify.count('B') == CAU_MIN_LENGTH) # Thêm bão bệt
+        
+        is_ziczac = True
+        for j in range(CAU_MIN_LENGTH - 1):
+            if pattern_to_classify[j] == pattern_to_classify[j+1]:
+                is_ziczac = False
+                break
+        
+        # Nếu mẫu cầu là bão, chỉ coi là bệt nếu tất cả đều là B
+        if 'B' in pattern_to_classify and (pattern_to_classify.count('B') != CAU_MIN_LENGTH):
+            is_bet = False
+            is_ziczac = False # Bão làm hỏng cả zíc-zắc
+
+        if is_bet:
+            expected_result = pattern_to_classify[-1] # Dự đoán sẽ tiếp tục bệt
+            if actual_result_for_pattern == expected_result:
+                if pattern_to_classify not in CAU_XAU[game_name]: # Nếu nó không phải cầu xấu, thêm vào đẹp
+                     CAU_DEP[game_name].add(pattern_to_classify)
+            else: # Dự đoán bệt sai, mẫu này là xấu
+                if pattern_to_classify in CAU_DEP[game_name]: # Nếu nó từng là cầu đẹp, xóa khỏi đẹp
+                     CAU_DEP[game_name].remove(pattern_to_classify)
+                CAU_XAU[game_name].add(pattern_to_classify)
+        elif is_ziczac:
+            # Dự đoán sẽ tiếp tục zíc-zắc (ngược lại ký tự cuối)
+            if pattern_to_classify[-1] == 'T': expected_result = 'X'
+            elif pattern_to_classify[-1] == 'X': expected_result = 'T'
+            else: expected_result = actual_result_for_pattern # Nếu là 'B', không theo zic-zac
+
+            if actual_result_for_pattern == expected_result:
+                if pattern_to_classify not in CAU_XAU[game_name]:
+                     CAU_DEP[game_name].add(pattern_to_classify)
+            else: # Dự đoán zíc-zắc sai, mẫu này là xấu
+                if pattern_to_classify in CAU_DEP[game_name]:
+                     CAU_DEP[game_name].remove(pattern_to_classify)
+                CAU_XAU[game_name].add(pattern_to_classify)
+        else:
+            # Đối với các mẫu cầu không phải bệt/zic-zac rõ ràng,
+            # bot hiện tại chưa có logic để phân loại là "đẹp" hay "xấu" một cách tự động.
+            # Có thể bỏ qua hoặc thêm logic phức tạp hơn (ví dụ: học máy) ở đây.
+            pass
+            
+    # Sau khi phân loại tất cả các mẫu trong lần học này, lưu vào DB
+    save_cau_patterns_to_db()
+
+def make_prediction(game_name):
+    """Đưa ra dự đoán cho phiên tiếp theo dựa trên các mẫu cầu đã học."""
+    recent_history_tx = get_recent_history_tx(game_name, limit=CAU_MIN_LENGTH)
+    
+    if len(recent_history_tx) < CAU_MIN_LENGTH:
+        return "Chưa đủ lịch sử để dự đoán mẫu cầu."
+    
+    current_cau_for_prediction = "".join(recent_history_tx[-CAU_MIN_LENGTH:])
+    
+    prediction_text = f"📊 Mẫu cầu hiện tại: **{current_cau_for_prediction}**\n"
+    
+    if current_cau_for_prediction in CAU_DEP[game_name]:
+        # Nếu mẫu cầu hiện tại là cầu đẹp, dự đoán tiếp tục theo mẫu
+        predicted_value = current_cau_for_prediction[-1] 
+        prediction_text += f"✅ Phát hiện mẫu cầu đẹp. Khả năng cao ra: **{predicted_value}**\n"
+    elif current_cau_for_prediction in CAU_XAU[game_name]:
+        # Nếu mẫu cầu hiện tại là cầu xấu, dự đoán ngược lại
+        predicted_value = 'T' if current_cau_for_prediction[-1] == 'X' else ('X' if current_cau_for_prediction[-1] == 'T' else 'T') # Nếu là 'B', coi như ngược lại thành T (chỉ ví dụ)
+        prediction_text += f"❌ Phát hiện mẫu cầu xấu. Khả năng cao ra: **{predicted_value}** (Dự đoán ngược)\n"
+    else:
+        prediction_text += "🧐 Chưa có mẫu cầu rõ ràng để dự đoán. Dự đoán dựa trên xác suất 50/50.\n"
+        # Dự đoán ngẫu nhiên hoặc theo một xu hướng đơn giản nếu không có mẫu rõ ràng
+        # Ví dụ: dự đoán ngược lại phiên trước đó nếu không có mẫu nào
+        # predicted_value = 'T' if recent_history_tx[-1] == 'X' else 'X'
+        # prediction_text += f"👉 Khả năng cao ra: **{predicted_value}** (Dự đoán ngược phiên trước)\n"
+        # Hoặc một dự đoán mặc định, ví dụ Tài
+        predicted_value = 'T' # Default prediction
+        prediction_text += f"👉 Khả năng cao ra: **{predicted_value}** (Dự đoán mặc định)\n"
+
+    return prediction_text, predicted_value # Trả về cả tin nhắn và giá trị dự đoán
+
+# --- Logic Xử lý Game ---
+def process_game(game_name, config):
+    """Kết nối API, xử lý dữ liệu phiên mới, lưu vào DB và gửi dự đoán."""
     url = config['api_url']
+    game_name_vi = config['game_name_vi']
+
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status() 
+        response.raise_for_status() # Báo lỗi nếu status code là 4xx hoặc 5xx
         data = response.json()
-        
-        # Normalize data structure for different APIs
-        if game_name == 'luckywin':
-            if data.get("state") != 1:
-                print(f"DEBUG: API {game_name} trả về state không thành công: {data.get('state')}. Phản hồi đầy đủ: {data}")
-                sys.stdout.flush()
-                return None
-            return data.get("data")
-        elif game_name in ['hitclub', 'sunwin']:
-            # Hit Club and Sunwin API directly return the result object
-            if "Ket_qua" not in data or "Phien" not in data or "Tong" not in data:
-                 print(f"DEBUG: API {game_name} không có đủ trường cần thiết. Phản hồi đầy đủ: {data}")
-                 sys.stdout.flush()
-                 return None
-            
-            # Map their keys to a common format
-            return {
-                "ID": str(data.get("Phien")),
-                "Expect": str(data.get("Phien")),
-                "OpenCode": f"{data.get('Xuc_xac_1')},{data.get('Xuc_xac_2')},{data.get('Xuc_xac_3')}",
-                "Ket_qua_raw": data.get("Ket_qua") # Keep raw result for debugging if needed
-            }
-        else:
-            print(f"LỖI: Game {game_name} không được cấu hình API.")
-            return None
 
-    except requests.exceptions.Timeout:
-        print(f"LỖI: Hết thời gian chờ khi lấy dữ liệu từ API {game_name}: {url}")
-        sys.stdout.flush()
-        return None
-    except requests.exceptions.ConnectionError as e:
-        print(f"LỖI: Lỗi kết nối khi lấy dữ liệu từ API {game_name}: {url} - {e}")
-        sys.stdout.flush()
-        return None
+        if data and 'logs' in data and data['logs']:
+            latest_log = data['logs'][0]
+            phien = latest_log.get('phien')
+            result_points = latest_log.get('result_points')
+            dices = latest_log.get('dices')
+
+            if phien and phien > LAST_FETCHED_IDS[game_name]:
+                # Đây là một phiên mới
+                LAST_FETCHED_IDS[game_name] = phien
+
+                if result_points is not None and dices and len(dices) == 3:
+                    total_point = sum(dices)
+                    result_tx = 'T' if total_point >= 11 else 'X'
+                    if dices[0] == dices[1] == dices[2]: # Nếu là bão
+                        result_tx = 'B'
+
+                    # Lưu kết quả phiên mới vào database
+                    save_game_result(game_name, phien, result_tx, total_point, dices[0], dices[1], dices[2])
+                    
+                    # Gọi hàm học mẫu cầu sau khi có dữ liệu mới
+                    classify_and_learn_cau(game_name)
+
+                    # Tạo tin nhắn dự đoán và kết quả
+                    prediction_text, _ = make_prediction(game_name) # Lấy tin nhắn dự đoán
+                    
+                    full_message = f"🔔 **Dự đoán {game_name_vi}**\n\n"
+                    full_message += prediction_text # Thêm phần dự đoán
+                    full_message += f"\n⚡ **Kết quả phiên {phien}**: "
+                    for i, dice in enumerate(dices):
+                        full_message += f"[{dice}] "
+                        if i < 2: full_message += "+ "
+                    full_message += f"= **{total_point}** ({result_tx})"
+                    
+                    # Gửi tin nhắn đến tất cả ADMIN_IDS
+                    for admin_id in ADMIN_IDS:
+                        bot.send_message(admin_id, full_message, parse_mode='Markdown')
+                        
+                    print(f"DEBUG: Đã xử lý và gửi dự đoán cho {game_name_vi} phiên {phien}.")
+                    sys.stdout.flush()
+                else:
+                    print(f"LỖI: Thiếu dữ liệu result_points hoặc dices từ API {game_name_vi} cho phiên {phien}.")
+                    sys.stdout.flush()
+            # else:
+            #     print(f"DEBUG: {game_name_vi} - Chưa có phiên mới (phien {phien} <= {LAST_FETCHED_IDS[game_name]})")
+            #     sys.stdout.flush()
+
     except requests.exceptions.RequestException as e:
-        print(f"LỖI: Lỗi HTTP hoặc Request khác khi lấy dữ liệu từ API {game_name}: {url} - {e}")
+        print(f"LỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
         sys.stdout.flush()
-        return None
-    except json.JSONDecodeError:
-        print(f"LỖI: Lỗi giải mã JSON từ API {game_name} ({url}). Phản hồi không phải JSON hợp lệ hoặc trống.")
-        print(f"DEBUG: Phản hồi thô nhận được từ {game_name}: {response.text}")
+    except json.JSONDecodeError as e:
+        print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}")
         sys.stdout.flush()
-        return None
     except Exception as e:
-        print(f"LỖI: Lỗi không xác định khi lấy dữ liệu API {game_name} ({url}): {e}")
+        print(f"LỖI: Xảy ra lỗi không xác định khi xử lý {game_name_vi}: {e}")
         sys.stdout.flush()
-        return None
 
-# --- Logic chính của Bot dự đoán (chạy trong luồng riêng) ---
-def prediction_loop(game_name, stop_event: Event):
-    last_id = None
-    tx_history = [] # Lịch sử Tài/Xỉu/Bão của 5 phiên gần nhất
-    
-    print(f"LOG: Luồng dự đoán cho {game_name} đã khởi động.")
-    sys.stdout.flush()
-
-    while not stop_event.is_set():
-        config = GAME_CONFIGS[game_name]
-
-        if not bot_enabled:
-            # print(f"LOG: Bot dự đoán toàn cục đang tạm dừng. Lý do: {bot_disable_reason}")
-            time.sleep(10) 
-            continue
-        
-        if not config['prediction_enabled']:
-            # print(f"LOG: Bot dự đoán cho {game_name} đang tạm dừng.")
-            time.sleep(10)
-            continue
-
-        if config['maintenance_mode']:
-            # print(f"LOG: Game {game_name} đang bảo trì. Lý do: {config['maintenance_reason']}")
-            time.sleep(10)
-            continue
-
-        data = lay_du_lieu(game_name)
-        if not data:
-            print(f"LOG: ❌ {game_name}: Không lấy được dữ liệu từ API hoặc dữ liệu không hợp lệ. Đang chờ phiên mới...")
-            sys.stdout.flush()
-            time.sleep(5)
-            continue
-
-        issue_id = data.get("ID")
-        expect = data.get("Expect")
-        open_code = data.get("OpenCode")
-
-        if not all([issue_id, expect, open_code]):
-            print(f"LOG: {game_name}: Dữ liệu API không đầy đủ (thiếu ID, Expect, hoặc OpenCode) cho phiên {expect}. Bỏ qua phiên này. Dữ liệu: {data}")
-            sys.stdout.flush()
-            time.sleep(5)
-            continue
-
-        if issue_id != last_id:
-            try:
-                dice = tuple(map(int, open_code.split(",")))
-                if len(dice) != 3: 
-                    raise ValueError("OpenCode không chứa 3 giá trị xúc xắc.")
-            except ValueError as e:
-                print(f"LỖI: {game_name}: Lỗi phân tích OpenCode: '{open_code}'. {e}. Bỏ qua phiên này.")
-                sys.stdout.flush()
-                last_id = issue_id 
-                time.sleep(5)
-                continue
-            except Exception as e:
-                print(f"LỖI: {game_name}: Lỗi không xác định khi xử lý OpenCode '{open_code}': {e}. Bỏ qua phiên này.")
-                sys.stdout.flush()
-                last_id = issue_id
-                time.sleep(5)
-                continue
-            
-            ket_qua_tx, tong = tinh_tai_xiu(dice)
-
-            # Lưu lịch sử 5 phiên
-            if len(tx_history) >= 5:
-                tx_history.pop(0)
-            tx_history.append("T" if ket_qua_tx == "Tài" else ("X" if ket_qua_tx == "Xỉu" else "B")) # Thêm 'B' cho Bão
-
-            next_expect = str(int(expect) + 1).zfill(len(expect))
-            du_doan = du_doan_theo_xi_ngau([dice])
-
-            ly_do = ""
-            current_cau = ""
-
-            if len(tx_history) < 5:
-                ly_do = "AI Dự đoán theo xí ngầu (chưa đủ mẫu cầu)"
-            else:
-                current_cau = ''.join(tx_history)
-                if is_cau_dep(game_name, current_cau):
-                    ly_do = f"AI Cầu đẹp ({current_cau}) → Giữ nguyên kết quả"
-                elif is_cau_xau(game_name, current_cau):
-                    du_doan = "Xỉu" if du_doan == "Tài" else "Tài" # Đảo chiều
-                    ly_do = f"AI Cầu xấu ({current_cau}) → Đảo chiều kết quả"
-                else:
-                    ly_do = f"AI Không rõ mẫu cầu ({current_cau}) → Dự đoán theo xí ngầu"
-            
-            # Cập nhật mẫu cầu dựa trên kết quả thực tế
-            if len(tx_history) >= 5:
-                # Chỉ cập nhật mẫu cầu nếu không phải là Bão
-                if ket_qua_tx != "Bão":
-                    prediction_correct = (du_doan == "Tài" and ket_qua_tx == "Tài") or \
-                                         (du_doan == "Xỉu" and ket_qua_tx == "Xỉu")
-                    update_cau_patterns(game_name, current_cau, prediction_correct)
-                    print(f"DEBUG: {game_name}: Cập nhật mẫu cầu: '{current_cau}' - Chính xác: {prediction_correct}")
-                else:
-                    print(f"DEBUG: {game_name}: Không cập nhật mẫu cầu do là kết quả Bão.")
-                sys.stdout.flush()
-
-            # Cập nhật thống kê
-            config['prediction_stats']['total'] += 1
-            if du_doan == ket_qua_tx:
-                config['prediction_stats']['correct'] += 1
-            else:
-                config['prediction_stats']['wrong'] += 1
-            save_bot_status() # Save stats
-
-            prediction_message = (
-                f"🎲 **[{config['game_name_vi'].upper()}] KẾT QUẢ PHIÊN HIỆN TẠI** 🎲\n"
-                f"Phiên: `{expect}` | Kết quả: **{ket_qua_tx}** (Tổng: **{tong}**)\n\n"
-                f"**Dự đoán cho phiên tiếp theo:**\n"
-                f"🔢 Phiên: `{next_expect}`\n"
-                f"🤖 Dự đoán: **{du_doan}**\n"
-                f"📌 Lý do: _{ly_do}_\n"
-                f"⚠️ **Hãy đặt cược sớm trước khi phiên kết thúc!**"
-            )
-
-            # Gửi tin nhắn dự đoán tới tất cả người dùng có quyền truy cập và đang nhận dự đoán cho game này
-            for user_id_int in list(config['users_receiving']): 
-                user_id_str = str(user_id_int)
-                is_sub, sub_message = check_subscription(user_id_int)
-                
-                # Check if user opted to receive predictions for this specific game
-                if user_id_str in user_data and user_data[user_id_str]['receiving_games'].get(game_name, False):
-                    if is_sub:
-                        # Allow Admin/Override users to receive even during maintenance
-                        if config['maintenance_mode'] and not can_override_maintenance(user_id_int):
-                            # print(f"DEBUG: Không gửi dự đoán cho user {user_id_str} vì {game_name} đang bảo trì và không có quyền override.")
-                            continue
-
-                        try:
-                            bot.send_message(user_id_int, prediction_message, parse_mode='Markdown')
-                            # print(f"DEBUG: Đã gửi dự đoán {game_name} cho user {user_id_str}")
-                            sys.stdout.flush()
-                        except telebot.apihelper.ApiTelegramException as e:
-                            print(f"LỖI: Lỗi Telegram API khi gửi tin nhắn cho user {user_id_int} ({game_name}): {e}")
-                            sys.stdout.flush()
-                            if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
-                                print(f"CẢNH BÁO: Người dùng {user_id_int} đã chặn bot hoặc bị vô hiệu hóa. Xóa khỏi danh sách nhận.")
-                                config['users_receiving'].discard(user_id_int)
-                                user_data[user_id_str]['receiving_games'][game_name] = False # Mark as not receiving
-                                save_user_data(user_data)
-                        except Exception as e:
-                            print(f"LỖI: Lỗi không xác định khi gửi tin nhắn cho user {user_id_int} ({game_name}): {e}")
-                            sys.stdout.flush()
-                    # else:
-                        # print(f"DEBUG: Không gửi dự đoán {game_name} cho user {user_id_str} vì hết hạn/bị cấm.")
-
-            print("-" * 50)
-            print("LOG: {}: Phiên {} -> {}. Kết quả: {} ({}). Dự đoán: {}. Lý do: {}".format(config['game_name_vi'], expect, next_expect, ket_qua_tx, tong, du_doan, ly_do))
-            print("-" * 50)
-            sys.stdout.flush()
-
-            last_id = issue_id
-
-        time.sleep(5) # Đợi 5 giây trước khi kiểm tra phiên mới
-    print(f"LOG: Luồng dự đoán cho {game_name} đã dừng.")
-    sys.stdout.flush()
-
-# --- Xử lý lệnh Telegram ---
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = str(message.chat.id)
-    username = message.from_user.username or message.from_user.first_name
-    
-    if user_id not in user_data:
-        user_data[user_id] = {
-            'username': username,
-            'expiry_date': None,
-            'is_ctv': False,
-            'banned': False,
-            'ban_reason': None,
-            'override_maintenance': False,
-            'receiving_games': {game: True for game in GAME_CONFIGS.keys()} # Mặc định nhận tất cả
-        }
-        save_user_data(user_data)
-        # Add user to all active game receiving lists
+# --- Lặp để kiểm tra API (chạy trong một luồng riêng) ---
+def check_apis_loop():
+    """Vòng lặp chính để kiểm tra API của tất cả các game."""
+    while True:
         for game_name, config in GAME_CONFIGS.items():
-            config['users_receiving'].add(int(user_id))
+            process_game(game_name, config)
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
-        bot.reply_to(message, 
-                     "Chào mừng bạn đến với **BOT DỰ ĐOÁN TÀI XỈU SUNWIN**!\n"
-                     "Hãy dùng lệnh /help để xem danh sách các lệnh hỗ trợ.", 
-                     parse_mode='Markdown')
-    else:
-        user_data[user_id]['username'] = username # Cập nhật username nếu có thay đổi
-        # Ensure 'receiving_games' is initialized for existing users
-        user_data[user_id].setdefault('receiving_games', {game: True for game in GAME_CONFIGS.keys()})
-        # Add existing user to active game receiving lists if they are set to receive
-        for game_name, config in GAME_CONFIGS.items():
-            if user_data[user_id]['receiving_games'].get(game_name, False) and not user_data[user_id]['banned']:
-                config['users_receiving'].add(int(user_id))
-
-        save_user_data(user_data)
-        bot.reply_to(message, "Bạn đã khởi động bot rồi. Dùng /help để xem các lệnh.")
-
-@bot.message_handler(commands=['help'])
+# --- Các Lệnh của Bot ---
+@bot.message_handler(commands=['start', 'help'])
 def show_help(message):
+    """Hiển thị tin nhắn trợ giúp và các lệnh có sẵn."""
     help_text = (
-        "🤖 **DANH SÁCH LỆNH HỖ TRỢ** 🤖\n\n"
-        "**Lệnh người dùng:**\n"
-        "🔸 `/start`: Khởi động bot và thêm bạn vào hệ thống.\n"
-        "🔸 `/help`: Hiển thị danh sách các lệnh.\n"
-        "🔸 `/support`: Thông tin hỗ trợ Admin.\n"
-        "🔸 `/gia`: Xem bảng giá dịch vụ.\n"
-        "🔸 `/gopy <nội dung>`: Gửi góp ý/báo lỗi cho Admin.\n"
-        "🔸 `/nap`: Hướng dẫn nạp tiền.\n"
-        "🔸 `/dudoan`: Bắt đầu nhận dự đoán cho Luckywin.\n"
-        "🔸 `/dudoan_hitclub`: Bắt đầu nhận dự đoán cho Hit Club.\n"
-        "🔸 `/dudoan_sunwin`: Bắt đầu nhận dự đoán cho Sunwin.\n"
-        "🔸 `/code <mã_code>`: Nhập mã code để gia hạn tài khoản.\n"
-        "🔸 `/stop [tên game]`: Tạm ngừng nhận dự đoán (để trống để tạm ngừng tất cả, hoặc chỉ định game).\n"
-        "🔸 `/continue [tên game]`: Tiếp tục nhận dự đoán (để trống để tiếp tục tất cả, hoặc chỉ định game).\n\n"
+        "Xin chào! Tôi là bot dự đoán Tài Xỉu.\n"
+        "Tôi sẽ tự động gửi kết quả và dự đoán cho các game sau:\n"
     )
+    for _, config in GAME_CONFIGS.items():
+        help_text += f"- **{config['game_name_vi']}**\n"
     
-    if is_ctv(message.chat.id):
-        help_text += (
-            "**Lệnh Admin/CTV:**\n"
-            "🔹 `/full <id>`: Xem thông tin người dùng (để trống ID để xem của bạn).\n"
-            "🔹 `/giahan <id> <số ngày/giờ>`: Gia hạn tài khoản người dùng. Ví dụ: `/giahan 12345 1 ngày` hoặc `/giahan 12345 24 giờ`.\n\n"
-        )
+    help_text += "\n"
     
     if is_admin(message.chat.id):
         help_text += (
-            "**Lệnh Admin Chính:**\n"
-            "👑 `/ctv <id>`: Thêm người dùng làm CTV.\n"
-            "👑 `/xoactv <id>`: Xóa người dùng khỏi CTV.\n"
-            "👑 `/tb <nội dung>`: Gửi thông báo đến tất cả người dùng.\n"
-            "👑 `/tatbot <lý do>`: Tắt mọi hoạt động của bot dự đoán.\n"
-            "👑 `/mokbot`: Mở lại hoạt động của bot dự đoán.\n"
-            "👑 `/taocode <giá trị> <ngày/giờ> <số lượng>`: Tạo mã code gia hạn. Ví dụ: `/taocode 1 ngày 5`.\n"
-            "👑 `/maucau <tên game>`: Hiển thị các mẫu cầu đã thu thập cho game.\n"
-            "👑 `/kiemtra`: Kiểm tra thông tin tất cả người dùng bot.\n"
-            "👑 `/xoahan <id>`: Xóa số ngày còn lại của người dùng.\n"
-            "👑 `/ban <id> [lý do]`: Cấm người dùng sử dụng bot.\n"
-            "👑 `/unban <id>`: Bỏ cấm người dùng.\n"
-            "👑 `/baotri <tên game> [lý do]`: Đặt game vào trạng thái bảo trì.\n"
-            "👑 `/mobaochi <tên game>`: Bỏ trạng thái bảo trì cho game.\n"
-            "👑 `/override <id>`: Cấp quyền Admin/CTV vẫn nhận dự đoán khi game bảo trì.\n"
-            "👑 `/unoverride <id>`: Xóa quyền Admin/CTV override bảo trì.\n"
-            "👑 `/stats [tên game]`: Xem thống kê dự đoán của bot.\n"
+            "--- 👑 Lệnh dành cho Admin 👑 ---\n"
+            "👑 `/status`: Xem trạng thái bot và thống kê mẫu cầu.\n"
+            "👑 `/trichcau`: Trích xuất toàn bộ dữ liệu mẫu cầu đã học ra file TXT.\n"
+            "👑 `/nhapcau`: Nhập lại dữ liệu mẫu cầu đã học từ file TXT bạn gửi lên.\n"
+            "👑 `/reset_patterns`: Đặt lại toàn bộ mẫu cầu đã học (cần xác nhận).\n"
+            "👑 `/history <tên_game> <số_lượng>`: Lấy lịch sử N phiên của game (ví dụ: `/history luckywin 10`).\n"
         )
-    
+    else:
+        help_text += "Nếu bạn có thắc mắc, hãy liên hệ admin để biết thêm chi tiết."
+        
     bot.reply_to(message, help_text, parse_mode='Markdown')
 
-@bot.message_handler(commands=['support'])
-def show_support(message):
-    bot.reply_to(message, 
-        "Để được hỗ trợ, vui lòng liên hệ Admin:\n"
-        "@heheviptool hoặc @Besttaixiu999"
-    )
-
-@bot.message_handler(commands=['gia'])
-def show_price(message):
-    price_text = (
-        "📊 **BOT SUNWIN XIN THÔNG BÁO BẢNG GIÁ SUN BOT** 📊\n\n"
-        "💸 **20k**: 1 Ngày\n"
-        "💸 **50k**: 1 Tuần\n"
-        "💸 **80k**: 2 Tuần\n"
-        "💸 **130k**: 1 Tháng\n\n"
-        "🤖 BOT SUN TỈ Lệ **85-92%**\n"
-        "⏱️ ĐỌC 24/24\n\n"
-        "Vui Lòng ib @heheviptool hoặc @Besttaixiu999 Để Gia Hạn"
-    )
-    bot.reply_to(message, price_text, parse_mode='Markdown')
-
-@bot.message_handler(commands=['gopy'])
-def send_feedback(message):
-    feedback_text = telebot.util.extract_arguments(message.text)
-    if not feedback_text:
-        bot.reply_to(message, "Vui lòng nhập nội dung góp ý. Ví dụ: `/gopy Bot dự đoán rất chuẩn!`", parse_mode='Markdown')
-        return
-    
-    admin_id = ADMIN_IDS[0] # Gửi cho Admin đầu tiên trong danh sách
-    user_name = message.from_user.username or message.from_user.first_name
-    bot.send_message(admin_id, 
-                     f"📢 **GÓP Ý MỚI TỪ NGƯỜI DÙNG** 📢\n\n"
-                     f"**ID:** `{message.chat.id}`\n"
-                     f"**Tên:** @{user_name}\n\n"
-                     f"**Nội dung:**\n`{feedback_text}`",
-                     parse_mode='Markdown')
-    bot.reply_to(message, "Cảm ơn bạn đã gửi góp ý! Admin đã nhận được.")
-
-@bot.message_handler(commands=['nap'])
-def show_deposit_info(message):
-    user_id = message.chat.id
-    deposit_text = (
-        "⚜️ **NẠP TIỀN MUA LƯỢT** ⚜️\n\n"
-        "Để mua lượt, vui lòng chuyển khoản đến:\n"
-        "- Ngân hàng: **MB BANK**\n"
-        "- Số tài khoản: **0939766383**\n"
-        "- Tên chủ TK: **Nguyen Huynh Nhut Quang**\n\n"
-        "**NỘI DUNG CHUYỂN KHOẢN (QUAN TRỌNG):**\n"
-        "`mua luot {user_id}`\n\n"
-        f"❗️ Nội dung bắt buộc của bạn là:\n"
-        f"`mua luot {user_id}`\n\n"
-        "(Vui lòng sao chép đúng nội dung trên để được cộng lượt tự động)\n"
-        "Sau khi chuyển khoản, vui lòng chờ 1-2 phút. Nếu có sự cố, hãy dùng lệnh /support."
-    )
-    bot.reply_to(message, deposit_text, parse_mode='Markdown')
-
-# Hàm chung để xử lý lệnh /dudoan_<game>
-def handle_dudoan_command(message, game_name):
-    user_id = message.chat.id
-    user_id_str = str(user_id)
-    
-    is_sub, sub_message = check_subscription(user_id)
-    
-    if not is_sub:
-        bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin @heheviptool hoặc @Besttaixiu999 để được hỗ trợ.", parse_mode='Markdown')
-        return
-    
-    if not bot_enabled:
-        bot.reply_to(message, f"❌ Bot dự đoán toàn cục hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
+@bot.message_handler(commands=['status'])
+def show_status(message):
+    """Hiển thị trạng thái hiện tại của bot và thống kê mẫu cầu."""
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
 
-    game_config = GAME_CONFIGS.get(game_name)
-    if not game_config:
-        bot.reply_to(message, "Game này không được hỗ trợ.", parse_mode='Markdown')
-        return
+    status_message = "📊 **THỐNG KÊ BOT DỰ ĐOÁN** 📊\n\n"
 
-    if game_config['maintenance_mode'] and not can_override_maintenance(user_id):
-        bot.reply_to(message, f"❌ Game **{game_config['game_name_vi']}** hiện đang bảo trì. Lý do: `{game_config['maintenance_reason']}`", parse_mode='Markdown')
-        return
-    
-    if not game_config['prediction_enabled']:
-        bot.reply_to(message, f"❌ Dự đoán cho game **{game_config['game_name_vi']}** hiện đang tạm dừng. Vui lòng thử lại sau.", parse_mode='Markdown')
-        return
+    total_dep_patterns = 0
+    total_xau_patterns = 0
 
-    # Update user's preference to receive this game's predictions
-    if user_id_str not in user_data:
-        # This case should ideally not happen if /start is used first
-        user_data[user_id_str] = {'username': message.from_user.username or message.from_user.first_name, 'expiry_date': None, 'is_ctv': False, 'banned': False, 'ban_reason': None, 'override_maintenance': False, 'receiving_games': {game: False for game in GAME_CONFIGS.keys()}}
-    
-    user_data[user_id_str]['receiving_games'][game_name] = True
-    GAME_CONFIGS[game_name]['users_receiving'].add(user_id)
-    save_user_data(user_data)
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    bot.reply_to(message, f"✅ Bạn đang có quyền truy cập và sẽ nhận dự đoán cho game **{game_config['game_name_vi']}**.")
-
-@bot.message_handler(commands=['dudoan'])
-def start_prediction_luckywin(message):
-    handle_dudoan_command(message, 'luckywin')
-
-@bot.message_handler(commands=['dudoan_hitclub'])
-def start_prediction_hitclub(message):
-    handle_dudoan_command(message, 'hitclub')
-
-@bot.message_handler(commands=['dudoan_sunwin'])
-def start_prediction_sunwin(message):
-    handle_dudoan_command(message, 'sunwin')
-
-@bot.message_handler(commands=['stop'])
-def stop_receiving_predictions(message):
-    user_id = message.chat.id
-    user_id_str = str(user_id)
-    args = telebot.util.extract_arguments(message.text).lower().split()
-    
-    if user_id_str not in user_data:
-        bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
-        return
-
-    if not args: # Stop all games
-        for game_name, config in GAME_CONFIGS.items():
-            user_data[user_id_str]['receiving_games'][game_name] = False
-            config['users_receiving'].discard(user_id)
-        save_user_data(user_data)
-        bot.reply_to(message, "Đã tạm ngừng nhận dự đoán cho **tất cả các game**.", parse_mode='Markdown')
-    else: # Stop specific game
-        game_arg = args[0]
-        matched_game = None
-        for game_key, config in GAME_CONFIGS.items():
-            if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-                matched_game = game_key
-                break
+    for game_name, config in GAME_CONFIGS.items():
+        status_message += f"**{config['game_name_vi']}**:\n"
         
-        if matched_game:
-            user_data[user_id_str]['receiving_games'][matched_game] = False
-            GAME_CONFIGS[matched_game]['users_receiving'].discard(user_id)
-            save_user_data(user_data)
-            bot.reply_to(message, f"Đã tạm ngừng nhận dự đoán cho game **{GAME_CONFIGS[matched_game]['game_name_vi']}**.", parse_mode='Markdown')
-        else:
-            bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
+        # Lấy số lượng mẫu cầu từ RAM (đã được load từ DB)
+        dep_count = len(CAU_DEP.get(game_name, set()))
+        xau_count = len(CAU_XAU.get(game_name, set()))
+        status_message += f"  - Mẫu cầu đẹp: {dep_count}\n"
+        status_message += f"  - Mẫu cầu xấu: {xau_count}\n"
+        total_dep_patterns += dep_count
+        total_xau_patterns += xau_count
 
-@bot.message_handler(commands=['continue'])
-def continue_receiving_predictions(message):
-    user_id = message.chat.id
-    user_id_str = str(user_id)
-    args = telebot.util.extract_arguments(message.text).lower().split()
-
-    is_sub, sub_message = check_subscription(user_id)
-    if not is_sub:
-        bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin để được hỗ trợ.", parse_mode='Markdown')
-        return
-
-    if user_id_str not in user_data:
-        bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
-        return
-
-    if not args: # Continue all games
-        for game_name, config in GAME_CONFIGS.items():
-            # Check for global bot enable and game maintenance
-            if not bot_enabled:
-                bot.reply_to(message, f"❌ Bot dự đoán toàn cục hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
-                continue
-            if config['maintenance_mode'] and not can_override_maintenance(user_id):
-                bot.reply_to(message, f"❌ Game **{config['game_name_vi']}** hiện đang bảo trì. Lý do: `{config['maintenance_reason']}`", parse_mode='Markdown')
-                continue
-            if not config['prediction_enabled']:
-                bot.reply_to(message, f"❌ Dự đoán cho game **{config['game_name_vi']}** hiện đang tạm dừng. Vui lòng thử lại sau.", parse_mode='Markdown')
-                continue
-
-            user_data[user_id_str]['receiving_games'][game_name] = True
-            config['users_receiving'].add(user_id)
-        save_user_data(user_data)
-        bot.reply_to(message, "Đã tiếp tục nhận dự đoán cho **tất cả các game** (nếu game không bảo trì và bot hoạt động).", parse_mode='Markdown')
-    else: # Continue specific game
-        game_arg = args[0]
-        matched_game = None
-        for game_key, config in GAME_CONFIGS.items():
-            if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-                matched_game = game_key
-                break
-        
-        if matched_game:
-            game_config = GAME_CONFIGS[matched_game]
-            if not bot_enabled:
-                bot.reply_to(message, f"❌ Bot dự đoán toàn cục hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
-                return
-            if game_config['maintenance_mode'] and not can_override_maintenance(user_id):
-                bot.reply_to(message, f"❌ Game **{game_config['game_name_vi']}** hiện đang bảo trì. Lý do: `{game_config['maintenance_reason']}`", parse_mode='Markdown')
-                return
-            if not game_config['prediction_enabled']:
-                bot.reply_to(message, f"❌ Dự đoán cho game **{game_config['game_name_vi']}** hiện đang tạm dừng. Vui lòng thử lại sau.", parse_mode='Markdown')
-                return
-
-            user_data[user_id_str]['receiving_games'][matched_game] = True
-            game_config['users_receiving'].add(user_id)
-            save_user_data(user_data)
-            bot.reply_to(message, f"Đã tiếp tục nhận dự đoán cho game **{game_config['game_name_vi']}**.", parse_mode='Markdown')
-        else:
-            bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
-
-@bot.message_handler(commands=['maucau'])
-def show_cau_patterns_command(message):
-    if not is_admin(message.chat.id): # Chỉ Admin mới được xem mẫu cầu chi tiết
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    args = telebot.util.extract_arguments(message.text).lower().split()
-    if not args:
-        bot.reply_to(message, "Vui lòng chỉ định tên game để xem mẫu cầu. Ví dụ: `/maucau luckywin`", parse_mode='Markdown')
-        return
+        # Lấy tổng số lịch sử phiên từ DB
+        cursor.execute(f"SELECT COUNT(*) FROM {config['history_table']}")
+        total_history = cursor.fetchone()[0]
+        status_message += f"  - Tổng lịch sử phiên trong DB: {total_history}\n\n"
     
-    game_arg = args[0]
-    matched_game = None
-    for game_key, config in GAME_CONFIGS.items():
-        if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-            matched_game = game_key
-            break
+    conn.close()
+
+    status_message += f"**Tổng cộng các mẫu cầu đã học (trong RAM):**\n"
+    status_message += f"  - Cầu đẹp: {total_dep_patterns}\n"
+    status_message += f"  - Cầu xấu: {total_xau_patterns}\n"
     
-    if not matched_game:
-        bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
-        return
+    bot.reply_to(message, status_message, parse_mode='Markdown')
 
-    dep_patterns = "\n".join(sorted(list(CAU_DEP.get(matched_game, set())))) if CAU_DEP.get(matched_game) else "Không có"
-    xau_patterns = "\n".join(sorted(list(CAU_XAU.get(matched_game, set())))) if CAU_XAU.get(matched_game) else "Không có"
-
-    pattern_text = (
-        f"📚 **CÁC MẪU CẦU ĐÃ THU THẬP CHO {GAME_CONFIGS[matched_game]['game_name_vi'].upper()}** 📚\n\n"
-        "**🟢 Cầu Đẹp:**\n"
-        f"```\n{dep_patterns}\n```\n\n"
-        "**🔴 Cầu Xấu:**\n"
-        f"```\n{xau_patterns}\n```\n"
-        "*(Các mẫu cầu này được bot tự động học hỏi theo thời gian.)*"
-    )
-    bot.reply_to(message, pattern_text, parse_mode='Markdown')
-
-@bot.message_handler(commands=['code'])
-def use_code(message):
-    code_str = telebot.util.extract_arguments(message.text)
-    user_id = str(message.chat.id)
-
-    if not code_str:
-        bot.reply_to(message, "Vui lòng nhập mã code. Ví dụ: `/code ABCXYZ`", parse_mode='Markdown')
-        return
-    
-    if code_str not in GENERATED_CODES:
-        bot.reply_to(message, "❌ Mã code không tồn tại hoặc đã hết hạn.")
-        return
-
-    code_info = GENERATED_CODES[code_str]
-    if code_info.get('used_by') is not None:
-        bot.reply_to(message, "❌ Mã code này đã được sử dụng rồi.")
-        return
-
-    # Apply extension
-    current_expiry_str = user_data.get(user_id, {}).get('expiry_date')
-    if current_expiry_str:
-        current_expiry_date = datetime.strptime(current_expiry_str, '%Y-%m-%d %H:%M:%S')
-        # If current expiry is in the past, start from now
-        if datetime.now() > current_expiry_date:
-            new_expiry_date = datetime.now()
-        else:
-            new_expiry_date = current_expiry_date
-    else:
-        new_expiry_date = datetime.now() # Start from now if no previous expiry
-
-    value = code_info['value']
-    if code_info['type'] == 'ngày':
-        new_expiry_date += timedelta(days=value)
-    elif code_info['type'] == 'giờ':
-        new_expiry_date += timedelta(hours=value)
-    
-    user_data.setdefault(user_id, {})['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
-    user_data[user_id]['username'] = message.from_user.username or message.from_user.first_name
-    # Ensure 'receiving_games' is initialized for this user
-    user_data[user_id].setdefault('receiving_games', {game: True for game in GAME_CONFIGS.keys()})
-    
-    GENERATED_CODES[code_str]['used_by'] = user_id
-    GENERATED_CODES[code_str]['used_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    save_user_data(user_data)
-    save_codes()
-
-    bot.reply_to(message, 
-                 f"🎉 Bạn đã đổi mã code thành công! Tài khoản của bạn đã được gia hạn thêm **{value} {code_info['type']}**.\n"
-                 f"Ngày hết hạn mới: `{user_data[user_id]['expiry_date']}`", 
-                 parse_mode='Markdown')
-
-def user_expiry_date(user_id):
-    if str(user_id) in user_data and user_data[str(user_id)].get('expiry_date'):
-        return user_data[str(user_id)]['expiry_date']
-    return "Không có"
-
-# --- Lệnh Admin/CTV ---
-@bot.message_handler(commands=['full'])
-def get_user_info(message):
-    if not is_ctv(message.chat.id):
+@bot.message_handler(commands=['reset_patterns'])
+def reset_patterns_confirmation(message):
+    """Yêu cầu xác nhận trước khi xóa toàn bộ mẫu cầu đã học."""
+    if not is_admin(message.chat.id):
         bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
     
-    args = telebot.util.extract_arguments(message.text).split()
-    target_user_id_str = str(message.chat.id)
-    if args and args[0].isdigit():
-        target_user_id_str = args[0]
-    
-    if target_user_id_str not in user_data:
-        bot.reply_to(message, f"Không tìm thấy thông tin cho người dùng ID `{target_user_id_str}`.")
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("✅ Xác nhận Reset", callback_data="confirm_reset_patterns"))
+    bot.reply_to(message, "Bạn có chắc chắn muốn xóa toàn bộ mẫu cầu đã học không? Hành động này không thể hoàn tác và bot sẽ phải học lại từ đầu.", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "confirm_reset_patterns")
+def confirm_reset_patterns(call):
+    """Xử lý xác nhận xóa mẫu cầu."""
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Bạn không có quyền thực hiện hành động này.")
         return
 
-    user_info = user_data[target_user_id_str]
-    expiry_date_str = user_info.get('expiry_date', 'Không có')
-    username = user_info.get('username', 'Không rõ')
-    is_ctv_status = "Có" if is_ctv(int(target_user_id_str)) else "Không"
-    banned_status = "Có" if user_info.get('banned') else "Không"
-    ban_reason = f"Lý do: `{user_info.get('ban_reason')}`" if user_info.get('banned') and user_info.get('ban_reason') else ""
-    override_status = "Có" if user_info.get('override_maintenance') else "Không"
-
-    receiving_games_status = []
-    for game_name, is_receiving in user_info.get('receiving_games', {}).items():
-        receiving_games_status.append(f"{GAME_CONFIGS[game_name]['game_name_vi']}: {'✅' if is_receiving else '❌'}")
-    receiving_games_text = "\n".join(receiving_games_status) if receiving_games_status else "Không cài đặt"
-
-
-    info_text = (
-        f"**THÔNG TIN NGƯỜI DÙNG**\n"
-        f"**ID:** `{target_user_id_str}`\n"
-        f"**Tên:** @{username}\n"
-        f"**Ngày hết hạn:** `{expiry_date_str}`\n"
-        f"**Là CTV/Admin:** {is_ctv_status}\n"
-        f"**Bị cấm:** {banned_status} {ban_reason}\n"
-        f"**Override Bảo trì:** {override_status}\n"
-        f"**Nhận dự đoán cho:**\n{receiving_games_text}"
-    )
-    bot.reply_to(message, info_text, parse_mode='Markdown')
-
-@bot.message_handler(commands=['giahan'])
-def extend_subscription(message):
-    if not is_ctv(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if len(args) != 3 or not args[0].isdigit() or not args[1].isdigit() or args[2].lower() not in ['ngày', 'giờ']:
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/giahan <id_nguoi_dung> <số_lượng> <ngày/giờ>`\n"
-                              "Ví dụ: `/giahan 12345 1 ngày` hoặc `/giahan 12345 24 giờ`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    value = int(args[1])
-    unit = args[2].lower() # 'ngày' or 'giờ'
-    
-    if target_user_id_str not in user_data:
-        user_data[target_user_id_str] = {
-            'username': "UnknownUser",
-            'expiry_date': None,
-            'is_ctv': False,
-            'banned': False,
-            'ban_reason': None,
-            'override_maintenance': False,
-            'receiving_games': {game: True for game in GAME_CONFIGS.keys()}
-        }
-        bot.send_message(message.chat.id, f"Đã tạo tài khoản mới cho user ID `{target_user_id_str}`.")
-        # Add to all game receiving lists by default
-        for game_name, config in GAME_CONFIGS.items():
-            config['users_receiving'].add(int(target_user_id_str))
-
-    current_expiry_str = user_data[target_user_id_str].get('expiry_date')
-    if current_expiry_str:
-        current_expiry_date = datetime.strptime(current_expiry_str, '%Y-%m-%d %H:%M:%S')
-        if datetime.now() > current_expiry_date:
-            new_expiry_date = datetime.now()
-        else:
-            new_expiry_date = current_expiry_date
-    else:
-        new_expiry_date = datetime.now() # Start from now if no previous expiry
-
-    if unit == 'ngày':
-        new_expiry_date += timedelta(days=value)
-    elif unit == 'giờ':
-        new_expiry_date += timedelta(hours=value)
-    
-    user_data[target_user_id_str]['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
-    save_user_data(user_data)
-    
-    bot.reply_to(message, 
-                 f"Đã gia hạn thành công cho user ID `{target_user_id_str}` thêm **{value} {unit}**.\n"
-                 f"Ngày hết hạn mới: `{user_data[target_user_id_str]['expiry_date']}`",
-                 parse_mode='Markdown')
-    
     try:
-        bot.send_message(int(target_user_id_str), 
-                         f"🎉 Tài khoản của bạn đã được gia hạn thêm **{value} {unit}** bởi Admin/CTV!\n"
-                         f"Ngày hết hạn mới của bạn là: `{user_data[target_user_id_str]['expiry_date']}`",
-                         parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-        if "bot was blocked by the user" in str(e):
-            print(f"CẢNH BÁO: Không thể thông báo gia hạn cho user {target_user_id_str}: Người dùng đã chặn bot.")
-        else:
-            print(f"LỖI: Không thể thông báo gia hạn cho user {target_user_id_str}: {e}")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cau_patterns")
+        conn.commit()
+        conn.close()
+
+        # Reset các biến toàn cục trong RAM
+        global CAU_DEP, CAU_XAU
+        CAU_DEP = {game: set() for game in GAME_CONFIGS.keys()}
+        CAU_XAU = {game: set() for game in GAME_CONFIGS.keys()}
+
+        bot.answer_callback_query(call.id, "Đã reset toàn bộ mẫu cầu!")
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
+                              text="✅ Toàn bộ mẫu cầu đã được xóa và reset trong database và bộ nhớ bot.")
+        print("DEBUG: Đã reset toàn bộ mẫu cầu từ DB và RAM.")
+        sys.stdout.flush()
+    except Exception as e:
+        bot.answer_callback_query(call.id, "Lỗi khi reset mẫu cầu.")
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
+                              text=f"Lỗi khi reset mẫu cầu: {e}")
+        print(f"LỖI: Lỗi khi reset mẫu cầu: {e}")
         sys.stdout.flush()
 
-# --- Lệnh Admin Chính ---
-@bot.message_handler(commands=['ctv'])
-def add_ctv(message):
+@bot.message_handler(commands=['history'])
+def get_game_history(message):
+    """Lấy và hiển thị lịch sử N phiên của một game cụ thể từ database."""
     if not is_admin(message.chat.id):
         bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/ctv <id_nguoi_dung>`", parse_mode='Markdown')
+
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "Cú pháp: `/history <tên_game> <số_lượng_phiên>`\nVí dụ: `/history luckywin 10`", parse_mode='Markdown')
         return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str not in user_data:
-        user_data[target_user_id_str] = {
-            'username': "UnknownUser",
-            'expiry_date': None,
-            'is_ctv': True,
-            'banned': False,
-            'ban_reason': None,
-            'override_maintenance': False,
-            'receiving_games': {game: True for game in GAME_CONFIGS.keys()}
-        }
-    else:
-        user_data[target_user_id_str]['is_ctv'] = True
-    
-    save_user_data(user_data)
-    bot.reply_to(message, f"Đã cấp quyền CTV cho user ID `{target_user_id_str}`.")
+
+    game_input = args[1].lower()
+    limit_str = args[2]
+
+    # Ánh xạ tên game đầu vào với keys trong GAME_CONFIGS
+    matched_game_key = None
+    for key, config in GAME_CONFIGS.items():
+        if game_input == key or game_input == config['game_name_vi'].lower().replace(' ', ''):
+            matched_game_key = key
+            break
+
+    if not matched_game_key:
+        bot.reply_to(message, f"Không tìm thấy game: '{game_input}'. Các game hỗ trợ: {', '.join([config['game_name_vi'] for config in GAME_CONFIGS.values()])}")
+        return
+
     try:
-        bot.send_message(int(target_user_id_str), "🎉 Bạn đã được cấp quyền CTV!")
-    except Exception:
-        pass
-
-@bot.message_handler(commands=['xoactv'])
-def remove_ctv(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/xoactv <id_nguoi_dung>`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str in user_data:
-        user_data[target_user_id_str]['is_ctv'] = False
-        save_user_data(user_data)
-        bot.reply_to(message, f"Đã xóa quyền CTV của user ID `{target_user_id_str}`.")
-        try:
-            bot.send_message(int(target_user_id_str), "❌ Quyền CTV của bạn đã bị gỡ bỏ.")
-        except Exception:
-            pass
-    else:
-        bot.reply_to(message, f"Không tìm thấy người dùng có ID `{target_user_id_str}`.")
-
-@bot.message_handler(commands=['tb'])
-def send_broadcast(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    broadcast_text = telebot.util.extract_arguments(message.text)
-    if not broadcast_text:
-        bot.reply_to(message, "Vui lòng nhập nội dung thông báo. Ví dụ: `/tb Bot sẽ bảo trì vào 2h sáng mai.`", parse_mode='Markdown')
-        return
-    
-    success_count = 0
-    fail_count = 0
-    for user_id_str in list(user_data.keys()):
-        try:
-            bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO TỪ ADMIN** 📢\n\n{broadcast_text}", parse_mode='Markdown')
-            success_count += 1
-            time.sleep(0.1) # Tránh bị rate limit
-        except telebot.apihelper.ApiTelegramException as e:
-            print(f"LỖI: Không thể gửi thông báo cho user {user_id_str}: {e}")
-            sys.stdout.flush()
-            fail_count += 1
-            if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
-                print(f"CẢNH BÁO: Người dùng {user_id_str} đã chặn bot hoặc bị vô hiệu hóa. Đang xóa người dùng khỏi danh sách nhận.")
-                # Remove user from all receiving lists
-                for game_name, config in GAME_CONFIGS.items():
-                    config['users_receiving'].discard(int(user_id_str))
-                if user_id_str in user_data:
-                    del user_data[user_id_str] # Remove completely
-                    save_user_data(user_data) # Save immediately
-        except Exception as e:
-            print(f"LỖI: Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
-            sys.stdout.flush()
-            fail_count += 1
-            
-    bot.reply_to(message, f"Đã gửi thông báo đến {success_count} người dùng. Thất bại: {fail_count}.")
-
-@bot.message_handler(commands=['tatbot'])
-def disable_bot_command(message):
-    global bot_enabled, bot_disable_reason, bot_disable_admin_id
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    reason = telebot.util.extract_arguments(message.text)
-    if not reason:
-        bot.reply_to(message, "Vui lòng nhập lý do tắt bot. Ví dụ: `/tatbot Bot đang bảo trì.`", parse_mode='Markdown')
-        return
-
-    bot_enabled = False
-    bot_disable_reason = reason
-    bot_disable_admin_id = message.chat.id
-    save_bot_status() # Save bot status
-    bot.reply_to(message, f"✅ Bot dự đoán đã được tắt bởi Admin `{message.from_user.username or message.from_user.first_name}`.\nLý do: `{reason}`", parse_mode='Markdown')
-    sys.stdout.flush()
-    
-    # Optionally notify all users
-    for user_id_str in list(user_data.keys()):
-        try:
-            bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO QUAN TRỌNG:** Bot dự đoán toàn bộ tạm thời dừng hoạt động.\nLý do: {reason}\nVui lòng chờ thông báo mở lại.", parse_mode='Markdown')
-        except Exception:
-            pass
-
-@bot.message_handler(commands=['mokbot'])
-def enable_bot_command(message):
-    global bot_enabled, bot_disable_reason, bot_disable_admin_id
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    if bot_enabled:
-        bot.reply_to(message, "Bot dự đoán đã và đang hoạt động rồi.")
-        return
-
-    bot_enabled = True
-    bot_disable_reason = "Không có"
-    bot_disable_admin_id = None
-    save_bot_status() # Save bot status
-    bot.reply_to(message, "✅ Bot dự đoán đã được mở lại bởi Admin.")
-    sys.stdout.flush()
-    
-    # Optionally notify all users
-    for user_id_str in list(user_data.keys()):
-        try:
-            bot.send_message(int(user_id_str), "🎉 **THÔNG BÁO:** Bot dự đoán toàn bộ đã hoạt động trở lại!.", parse_mode='Markdown')
-        except Exception:
-            pass
-
-@bot.message_handler(commands=['taocode'])
-def generate_code_command(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if len(args) < 2 or len(args) > 3: # Giá trị, đơn vị, số lượng (tùy chọn)
-        bot.reply_to(message, "Cú pháp sai. Ví dụ:\n"
-                              "`/taocode <giá_trị> <ngày/giờ> <số_lượng>`\n"
-                              "Ví dụ: `/taocode 1 ngày 5` (tạo 5 code 1 ngày)\n"
-                              "Hoặc: `/taocode 24 giờ` (tạo 1 code 24 giờ)", parse_mode='Markdown')
-        return
-    
-    try:
-        value = int(args[0])
-        unit = args[1].lower()
-        quantity = int(args[2]) if len(args) == 3 else 1 # Mặc định tạo 1 code nếu không có số lượng
-        
-        if unit not in ['ngày', 'giờ']:
-            bot.reply_to(message, "Đơn vị không hợp lệ. Chỉ chấp nhận `ngày` hoặc `giờ`.", parse_mode='Markdown')
+        limit = int(limit_str)
+        if limit <= 0 or limit > 200: # Giới hạn số lượng để tránh spam tin nhắn Telegram
+            bot.reply_to(message, "Số lượng phiên phải là số nguyên dương và không quá 200.")
             return
-        if value <= 0 or quantity <= 0:
-            bot.reply_to(message, "Giá trị hoặc số lượng phải lớn hơn 0.", parse_mode='Markdown')
-            return
-
-        generated_codes_list = []
-        for _ in range(quantity):
-            new_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)) # 8 ký tự ngẫu nhiên
-            GENERATED_CODES[new_code] = {
-                "value": value,
-                "type": unit,
-                "used_by": None,
-                "used_time": None
-            }
-            generated_codes_list.append(new_code)
-        
-        save_codes()
-        
-        response_text = f"✅ Đã tạo thành công {quantity} mã code gia hạn **{value} {unit}**:\n\n"
-        response_text += "\n".join([f"`{code}`" for code in generated_codes_list])
-        response_text += "\n\n_(Các mã này chưa được sử dụng)_"
-        
-        bot.reply_to(message, response_text, parse_mode='Markdown')
-
     except ValueError:
-        bot.reply_to(message, "Giá trị hoặc số lượng không hợp lệ. Vui lòng nhập số nguyên.", parse_mode='Markdown')
-    except Exception as e:
-        bot.reply_to(message, f"Đã xảy ra lỗi khi tạo code: {e}", parse_mode='Markdown')
-
-@bot.message_handler(commands=['kiemtra'])
-def check_all_users(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    if not user_data:
-        bot.reply_to(message, "Chưa có người dùng nào trong hệ thống.")
+        bot.reply_to(message, "Số lượng phiên phải là một số hợp lệ.")
         return
 
-    response_parts = ["📋 **THÔNG TIN TẤT CẢ NGƯỜI DÙNG** 📋\n"]
-    for user_id_str, user_info in user_data.items():
-        expiry_date_str = user_info.get('expiry_date', 'Không có')
-        username = user_info.get('username', 'Không rõ')
-        is_ctv_status = "CTV" if user_info.get('is_ctv') else "User"
-        banned_status = "🚫 Banned" if user_info.get('banned') else ""
-        
-        response_parts.append(f"• ID: `{user_id_str}` | Tên: @{username} | Hạn: `{expiry_date_str}` | Quyền: {is_ctv_status} {banned_status}")
-        
-        # Telegram message limit is 4096 characters, split if too long
-        if len("\n".join(response_parts)) > 3500: # Leave some buffer
-            bot.send_message(message.chat.id, "\n".join(response_parts), parse_mode='Markdown')
-            response_parts = [] # Reset for next part
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    if response_parts: # Send any remaining parts
-        bot.send_message(message.chat.id, "\n".join(response_parts), parse_mode='Markdown')
-
-@bot.message_handler(commands=['xoahan'])
-def clear_expiry(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/xoahan <id_nguoi_dung>`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str in user_data:
-        user_data[target_user_id_str]['expiry_date'] = None
-        save_user_data(user_data)
-        bot.reply_to(message, f"Đã xóa hạn sử dụng của user ID `{target_user_id_str}`.")
-        try:
-            bot.send_message(int(target_user_id_str), "❌ Hạn sử dụng tài khoản của bạn đã bị xóa bởi Admin.")
-        except Exception:
-            pass
-    else:
-        bot.reply_to(message, f"Không tìm thấy người dùng có ID `{target_user_id_str}`.")
-
-@bot.message_handler(commands=['ban'])
-def ban_user(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/ban <id_nguoi_dung> [lý do]`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    reason = " ".join(args[1:]) if len(args) > 1 else "Không có lý do cụ thể."
-
-    if target_user_id_str not in user_data:
-        user_data[target_user_id_str] = {
-            'username': "UnknownUser",
-            'expiry_date': None,
-            'is_ctv': False,
-            'banned': True,
-            'ban_reason': reason,
-            'override_maintenance': False,
-            'receiving_games': {game: False for game in GAME_CONFIGS.keys()} # Bị ban thì không nhận dự đoán
-        }
-    else:
-        user_data[target_user_id_str]['banned'] = True
-        user_data[target_user_id_str]['ban_reason'] = reason
-        # Also stop them from receiving any predictions
-        for game_name, config in GAME_CONFIGS.items():
-            user_data[target_user_id_str]['receiving_games'][game_name] = False
-            config['users_receiving'].discard(int(target_user_id_str))
-    
-    save_user_data(user_data)
-    bot.reply_to(message, f"Đã cấm user ID `{target_user_id_str}`. Lý do: `{reason}`", parse_mode='Markdown')
     try:
-        bot.send_message(int(target_user_id_str), f"🚫 Tài khoản của bạn đã bị cấm sử dụng bot bởi Admin. Lý do: `{reason}`")
-    except Exception:
-        pass
+        cursor.execute(f"SELECT phien, total_point, result_tx, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} ORDER BY phien DESC LIMIT ?", (limit,))
+        history_records = cursor.fetchall()
+        conn.close()
 
-@bot.message_handler(commands=['unban'])
-def unban_user(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/unban <id_nguoi_dung>`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str in user_data:
-        user_data[target_user_id_str]['banned'] = False
-        user_data[target_user_id_str]['ban_reason'] = None
-        # User is unbanned, let them receive predictions for games they previously opted for
-        for game_name, config in GAME_CONFIGS.items():
-             if user_data[target_user_id_str]['receiving_games'].get(game_name, False): # Only re-add if they were set to receive before
-                config['users_receiving'].add(int(target_user_id_str))
-
-        save_user_data(user_data)
-        bot.reply_to(message, f"Đã bỏ cấm user ID `{target_user_id_str}`.")
-        try:
-            bot.send_message(int(target_user_id_str), "✅ Tài khoản của bạn đã được bỏ cấm.")
-        except Exception:
-            pass
-    else:
-        bot.reply_to(message, f"Không tìm thấy người dùng có ID `{target_user_id_str}`.")
-
-@bot.message_handler(commands=['baotri'])
-def set_game_maintenance(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split(maxsplit=1) # Split only once to get reason
-    if len(args) < 1:
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/baotri <tên_game> [lý do]`", parse_mode='Markdown')
-        return
-    
-    game_arg = args[0].lower()
-    reason = args[1] if len(args) > 1 else "Bot đang bảo trì để nâng cấp."
-
-    matched_game = None
-    for game_key, config in GAME_CONFIGS.items():
-        if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-            matched_game = game_key
-            break
-    
-    if not matched_game:
-        bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
-        return
-
-    GAME_CONFIGS[matched_game]['maintenance_mode'] = True
-    GAME_CONFIGS[matched_game]['maintenance_reason'] = reason
-    save_bot_status() # Save game status
-
-    bot.reply_to(message, f"✅ Đã đặt game **{GAME_CONFIGS[matched_game]['game_name_vi']}** vào trạng thái bảo trì.\nLý do: `{reason}`", parse_mode='Markdown')
-    
-    # Notify all users receiving predictions for this game (who don't have override)
-    for user_id_int in list(GAME_CONFIGS[matched_game]['users_receiving']):
-        if not can_override_maintenance(user_id_int):
-            try:
-                bot.send_message(user_id_int, 
-                                 f"📢 **THÔNG BÁO BẢO TRÌ:** Game **{GAME_CONFIGS[matched_game]['game_name_vi']}** tạm thời dừng dự đoán.\nLý do: `{reason}`\nVui lòng chờ thông báo mở lại.", 
-                                 parse_mode='Markdown')
-            except Exception:
-                pass
-
-@bot.message_handler(commands=['mobaochi'])
-def unset_game_maintenance(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if len(args) < 1:
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/mobaochi <tên_game>`", parse_mode='Markdown')
-        return
-    
-    game_arg = args[0].lower()
-    matched_game = None
-    for game_key, config in GAME_CONFIGS.items():
-        if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-            matched_game = game_key
-            break
-    
-    if not matched_game:
-        bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
-        return
-
-    if not GAME_CONFIGS[matched_game]['maintenance_mode']:
-        bot.reply_to(message, f"Game **{GAME_CONFIGS[matched_game]['game_name_vi']}** không ở trạng thái bảo trì.", parse_mode='Markdown')
-        return
-
-    GAME_CONFIGS[matched_game]['maintenance_mode'] = False
-    GAME_CONFIGS[matched_game]['maintenance_reason'] = ""
-    save_bot_status() # Save game status
-
-    bot.reply_to(message, f"✅ Đã bỏ trạng thái bảo trì cho game **{GAME_CONFIGS[matched_game]['game_name_vi']}**.", parse_mode='Markdown')
-
-    # Notify all users previously receiving predictions for this game
-    for user_id_int in list(GAME_CONFIGS[matched_game]['users_receiving']):
-        try:
-            bot.send_message(user_id_int, 
-                             f"🎉 **THÔNG BÁO:** Game **{GAME_CONFIGS[matched_game]['game_name_vi']}** đã hoạt động trở lại! Bạn có thể tiếp tục nhận dự đoán.", 
-                             parse_mode='Markdown')
-        except Exception:
-            pass
-
-@bot.message_handler(commands=['override'])
-def add_override_permission(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/override <id_nguoi_dung>`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str not in user_data:
-        user_data[target_user_id_str] = {
-            'username': "UnknownUser",
-            'expiry_date': None,
-            'is_ctv': False,
-            'banned': False,
-            'ban_reason': None,
-            'override_maintenance': True, # Grant permission
-            'receiving_games': {game: True for game in GAME_CONFIGS.keys()}
-        }
-    else:
-        user_data[target_user_id_str]['override_maintenance'] = True
-    
-    save_user_data(user_data)
-    bot.reply_to(message, f"Đã cấp quyền override bảo trì cho user ID `{target_user_id_str}`.")
-    try:
-        bot.send_message(int(target_user_id_str), "🎉 Bạn đã được cấp quyền bỏ qua trạng thái bảo trì của game!")
-    except Exception:
-        pass
-
-@bot.message_handler(commands=['unoverride'])
-def remove_override_permission(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).split()
-    if not args or not args[0].isdigit():
-        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/unoverride <id_nguoi_dung>`", parse_mode='Markdown')
-        return
-    
-    target_user_id_str = args[0]
-    if target_user_id_str in user_data:
-        user_data[target_user_id_str]['override_maintenance'] = False
-        save_user_data(user_data)
-        bot.reply_to(message, f"Đã xóa quyền override bảo trì của user ID `{target_user_id_str}`.")
-        try:
-            bot.send_message(int(target_user_id_str), "❌ Quyền bỏ qua trạng thái bảo trì của bạn đã bị gỡ bỏ.")
-        except Exception:
-            pass
-    else:
-        bot.reply_to(message, f"Không tìm thấy người dùng có ID `{target_user_id_str}`.")
-
-@bot.message_handler(commands=['stats'])
-def show_prediction_stats(message):
-    if not is_admin(message.chat.id):
-        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
-        return
-    
-    args = telebot.util.extract_arguments(message.text).lower().split()
-    
-    stats_message = "📊 **THỐNG KÊ DỰ ĐOÁN CỦA BOT** 📊\n\n"
-    
-    if not args: # Show all games stats
-        for game_key, config in GAME_CONFIGS.items():
-            stats = config['prediction_stats']
-            total = stats['total']
-            correct = stats['correct']
-            wrong = stats['wrong']
-            accuracy = (correct / total * 100) if total > 0 else 0
-            
-            stats_message += (
-                f"**{config['game_name_vi']}**:\n"
-                f"  Tổng phiên dự đoán: `{total}`\n"
-                f"  Dự đoán đúng: `{correct}`\n"
-                f"  Dự đoán sai: `{wrong}`\n"
-                f"  Tỷ lệ chính xác: `{accuracy:.2f}%`\n\n"
-            )
-    else: # Show specific game stats
-        game_arg = args[0]
-        matched_game = None
-        for game_key, config in GAME_CONFIGS.items():
-            if game_key == game_arg or config['game_name_vi'].lower().replace(" ", "") == game_arg.replace(" ", ""):
-                matched_game = game_key
-                break
-        
-        if not matched_game:
-            bot.reply_to(message, "Tên game không hợp lệ. Các game được hỗ trợ: Luckywin, Hit Club, Sunwin.", parse_mode='Markdown')
+        if not history_records:
+            bot.reply_to(message, f"Không có lịch sử cho game **{GAME_CONFIGS[matched_game_key]['game_name_vi']}** trong database.", parse_mode='Markdown')
             return
         
-        config = GAME_CONFIGS[matched_game]
-        stats = config['prediction_stats']
-        total = stats['total']
-        correct = stats['correct']
-        wrong = stats['wrong']
-        accuracy = (correct / total * 100) if total > 0 else 0
+        history_message = f"**Lịch sử {limit} phiên gần nhất của {GAME_CONFIGS[matched_game_key]['game_name_vi']}**:\n\n"
+        for record in reversed(history_records): # Đảo ngược để hiển thị từ cũ đến mới
+            phien, total_point, result_tx, d1, d2, d3 = record
+            history_message += f"**#{phien}**: [{d1} {d2} {d3}] = **{total_point}** ({result_tx})\n"
         
-        stats_message += (
-            f"**{config['game_name_vi']}**:\n"
-            f"  Tổng phiên dự đoán: `{total}`\n"
-            f"  Dự đoán đúng: `{correct}`\n"
-            f"  Dự đoán sai: `{wrong}`\n"
-            f"  Tỷ lệ chính xác: `{accuracy:.2f}%`\n\n"
-        )
+        bot.reply_to(message, history_message, parse_mode='Markdown')
 
-    bot.reply_to(message, stats_message, parse_mode='Markdown')
+    except Exception as e:
+        bot.reply_to(message, f"Đã xảy ra lỗi khi lấy lịch sử: {e}")
+        print(f"LỖI: Lỗi khi lấy lịch sử game: {e}")
+        sys.stdout.flush()
 
-# --- Flask Routes cho Keep-Alive ---
-@app.route('/')
-def home():
-    return "Bot is alive and running!"
+# --- Chức năng Trích xuất dữ liệu mẫu cầu ra file TXT ---
+@bot.message_handler(commands=['trichcau'])
+def extract_cau_patterns(message):
+    """Trích xuất toàn bộ dữ liệu mẫu cầu đã học ra file TXT và gửi cho admin."""
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
 
-@app.route('/health')
-def health_check():
-    return "OK", 200
+    all_patterns_content = ""
+    for game_name, config in GAME_CONFIGS.items():
+        all_patterns_content += f"===== Mẫu cầu cho {config['game_name_vi']} =====\n\n"
+        
+        # Sắp xếp các mẫu để file dễ đọc hơn
+        dep_patterns = sorted(list(CAU_DEP.get(game_name, set())))
+        xau_patterns = sorted(list(CAU_XAU.get(game_name, set())))
+        
+        all_patterns_content += "--- Cầu Đẹp ---\n"
+        if dep_patterns:
+            all_patterns_content += "\n".join(dep_patterns) + "\n\n"
+        else:
+            all_patterns_content += "Không có mẫu cầu đẹp.\n\n"
 
-# --- Khởi tạo bot và các luồng khi Flask app khởi động ---
-@app.before_request
+        all_patterns_content += "--- Cầu Xấu ---\n"
+        if xau_patterns:
+            all_patterns_content += "\n".join(xau_patterns) + "\n\n"
+        else:
+            all_patterns_content += "Không có mẫu cầu xấu.\n\n"
+        
+        all_patterns_content += "\n" # Khoảng cách giữa các game
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"cau_patterns_{timestamp}.txt"
+    file_path = os.path.join(TEMP_DIR, file_name)
+
+    try:
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(all_patterns_content)
+        
+        with open(file_path, 'rb') as f_to_send:
+            bot.send_document(message.chat.id, f_to_send, caption="Đây là toàn bộ dữ liệu mẫu cầu đã học của bot. Bạn có thể sử dụng file này với lệnh `/nhapcau` để khôi phục.")
+        
+        os.remove(file_path) # Xóa file tạm sau khi gửi
+        print(f"DEBUG: Đã gửi và xóa file '{file_name}'.")
+        sys.stdout.flush()
+
+    except Exception as e:
+        bot.reply_to(message, f"Đã xảy ra lỗi khi trích xuất hoặc gửi file: {e}")
+        print(f"LỖI: Lỗi khi trích xuất mẫu cầu: {e}")
+        sys.stdout.flush()
+
+# --- Chức năng Nhập dữ liệu mẫu cầu từ file TXT ---
+@bot.message_handler(commands=['nhapcau'])
+def ask_for_cau_file(message):
+    """Yêu cầu admin gửi file TXT chứa dữ liệu mẫu cầu."""
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+
+    waiting_for_cau_file[message.chat.id] = True # Đặt trạng thái chờ file cho admin này
+    bot.reply_to(message, "Vui lòng gửi file `.txt` chứa dữ liệu mẫu cầu bạn muốn bot tải lại. Đảm bảo định dạng file giống file bot đã trích xuất bằng lệnh `/trichcau`.")
+
+@bot.message_handler(content_types=['document'])
+def handle_document_for_cau_patterns(message):
+    """Xử lý file TXT được gửi bởi admin để tải lại mẫu cầu."""
+    user_id = message.chat.id
+    # Chỉ xử lý nếu user là admin và đang trong trạng thái chờ file
+    if user_id not in ADMIN_IDS or not waiting_for_cau_file.get(user_id):
+        return
+
+    # Kiểm tra loại file
+    if message.document.mime_type != 'text/plain' or not message.document.file_name.endswith('.txt'):
+        bot.reply_to(message, "File bạn gửi không phải là file `.txt` hợp lệ. Vui lòng gửi lại file `.txt`.")
+        waiting_for_cau_file[user_id] = False # Reset trạng thái chờ
+        return
+
+    temp_file_path = None # Khởi tạo để đảm bảo luôn có thể xóa
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        # Lưu file tạm thời
+        temp_file_path = os.path.join(TEMP_DIR, message.document.file_name)
+        with open(temp_file_path, 'wb') as f:
+            f.write(downloaded_file)
+
+        # Tạo các set mới để lưu dữ liệu từ file
+        new_cau_dep = {game: set() for game in GAME_CONFIGS.keys()}
+        new_cau_xau = {game: set() for game in GAME_CONFIGS.keys()}
+        current_game = None
+        current_section = None # 'dep' or 'xau'
+
+        with open(temp_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("===== Mẫu cầu cho"):
+                    # Phát hiện game mới
+                    for game_key, config in GAME_CONFIGS.items():
+                        if config['game_name_vi'] in line:
+                            current_game = game_key
+                            break
+                    current_section = None # Reset section khi chuyển game
+                elif line == "--- Cầu Đẹp ---":
+                    current_section = 'dep'
+                elif line == "--- Cầu Xấu ---":
+                    current_section = 'xau'
+                elif line and current_game and current_section:
+                    # Bỏ qua các dòng thông báo "Không có mẫu cầu đẹp/xấu"
+                    if "Không có mẫu cầu" not in line:
+                        if current_section == 'dep':
+                            new_cau_dep[current_game].add(line)
+                        elif current_section == 'xau':
+                            new_cau_xau[current_game].add(line)
+        
+        # Cập nhật các biến global CAU_DEP và CAU_XAU
+        global CAU_DEP, CAU_XAU
+        CAU_DEP = new_cau_dep
+        CAU_XAU = new_cau_xau
+        save_cau_patterns_to_db() # Lưu các mẫu mới tải vào database
+
+        bot.reply_to(message, "✅ Đã tải lại dữ liệu mẫu cầu thành công từ file của bạn!")
+        print(f"DEBUG: Đã tải lại mẫu cầu từ file '{message.document.file_name}'.")
+        sys.stdout.flush()
+
+    except Exception as e:
+        bot.reply_to(message, f"Đã xảy ra lỗi khi xử lý file hoặc tải lại dữ liệu: {e}")
+        print(f"LỖI: Lỗi khi nhập mẫu cầu từ file: {e}")
+        sys.stdout.flush()
+    finally:
+        waiting_for_cau_file[user_id] = False # Reset trạng thái chờ
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path) # Xóa file tạm
+
+# --- Khởi động Bot ---
 def start_bot_threads():
-    global bot_initialized
-    with bot_init_lock:
-        if not bot_initialized:
-            print("LOG: Đang khởi tạo luồng bot và dự đoán...")
-            sys.stdout.flush()
-            
-            # Load initial data
-            load_user_data()
-            load_cau_patterns()
-            load_codes()
-            load_bot_status() # Load bot status and game configs
+    """Khởi tạo database, tải mẫu cầu và bắt đầu các luồng xử lý bot."""
+    # Khởi tạo Database và tải mẫu cầu khi bot khởi động
+    init_db()
+    load_cau_patterns_from_db()
 
-            # Start prediction loop for each game in a separate thread
-            for game_name in GAME_CONFIGS.keys():
-                prediction_stop_events[game_name] = Event()
-                prediction_thread = Thread(target=prediction_loop, args=(game_name, prediction_stop_events[game_name],))
-                prediction_thread.daemon = True 
-                prediction_thread.start()
-                print(f"LOG: Luồng dự đoán cho {game_name} đã khởi động.")
-                sys.stdout.flush()
+    # Khởi tạo luồng kiểm tra API
+    api_checker_thread = threading.Thread(target=check_apis_loop)
+    api_checker_thread.daemon = True # Đặt daemon thread để nó tự kết thúc khi chương trình chính kết thúc
+    api_checker_thread.start()
 
-            # Start bot polling in a separate thread
-            polling_thread = Thread(target=bot.infinity_polling, kwargs={'none_stop': True})
-            polling_thread.daemon = True 
-            polling_thread.start()
-            print("LOG: Luồng Telegram bot polling đã khởi động.")
-            sys.stdout.flush()
-            
-            bot_initialized = True
-            print("LOG: Bot đã được khởi tạo hoàn tất.")
-
-# --- Điểm khởi chạy chính cho Gunicorn/Render ---
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print(f"LOG: Khởi động Flask app trên cổng {port}")
+    # Bắt đầu bot lắng nghe tin nhắn
+    print("Bot đang khởi động và sẵn sàng nhận lệnh...")
     sys.stdout.flush()
-    app.run(host='0.0.0.0', port=port, debug=False)
+    bot.polling(none_stop=True)
+
+if __name__ == "__main__":
+    start_bot_threads()
