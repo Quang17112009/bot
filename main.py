@@ -16,14 +16,15 @@ from threading import Thread
 # --- Cấu hình Bot và Admin ---
 # THAY THẾ BẰNG BOT_TOKEN CỦA BẠN (Lấy từ BotFather, KHÔNG PHẢI TOKEN MẪU)
 BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
-# THAY THAY BẰNG ID TELEGRAM CỦA BẠN (VD: [123456789])
+# THAY THẾ BẰNG ID TELEGRAM CỦA BẠN (VD: [123456789, 987654321])
+# Admin ID có thể lấy từ bot @userinfobot trên Telegram
 ADMIN_IDS = [6915752059] 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- Cấu hình Game ---
-# LƯU Ý: Các URL API dưới đây vẫn là các URL cũ. 
-# Nếu các URL này không trả về định dạng JSON mới của bạn, 
-# bạn cần thay đổi chúng sang các API tương ứng.
+# LƯU Ý: Các URL API dưới đây là các URL bạn đã cung cấp. 
+# Nếu các URL này không trả về định dạng JSON hợp lệ hoặc không đúng như mong đợi, 
+# bạn cần thay đổi chúng sang các API tương ứng hoặc điều chỉnh phần xử lý JSON.
 GAME_CONFIGS = {
     'luckywin': {'api_url': 'https://luckywin01.com/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Luckywin', 'history_table': 'luckywin_history'},
     'hitclub': {'api_url': 'https://apphit.club/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Hit Club', 'history_table': 'hitclub_history'},
@@ -204,12 +205,13 @@ def classify_and_learn_cau(game_name):
                 is_ziczac = False
                 break
         
+        # Đặc biệt xử lý trường hợp có 'B' (bão) xen kẽ, không coi là cầu bet hay ziczac thuần túy
         if 'B' in pattern_to_classify and (pattern_to_classify.count('B') != CAU_MIN_LENGTH):
             is_bet = False
             is_ziczac = False 
 
         if is_bet:
-            expected_result = pattern_to_classify[-1]
+            expected_result = pattern_to_prediction(pattern_to_classify) # Dự đoán thẳng theo cầu bệt
             if actual_result_for_pattern == expected_result:
                 if pattern_to_classify not in CAU_XAU[game_name]:
                      CAU_DEP[game_name].add(pattern_to_classify)
@@ -218,10 +220,7 @@ def classify_and_learn_cau(game_name):
                      CAU_DEP[game_name].remove(pattern_to_classify)
                 CAU_XAU[game_name].add(pattern_to_classify)
         elif is_ziczac:
-            if pattern_to_classify[-1] == 'T': expected_result = 'X'
-            elif pattern_to_classify[-1] == 'X': expected_result = 'T'
-            else: expected_result = actual_result_for_pattern
-
+            expected_result = pattern_to_prediction(pattern_to_classify) # Dự đoán thẳng theo cầu ziczac
             if actual_result_for_pattern == expected_result:
                 if pattern_to_classify not in CAU_XAU[game_name]:
                      CAU_DEP[game_name].add(pattern_to_classify)
@@ -234,12 +233,33 @@ def classify_and_learn_cau(game_name):
 
     save_cau_patterns_to_db()
 
+def pattern_to_prediction(pattern):
+    """
+    Dự đoán kết quả tiếp theo dựa trên mẫu cầu.
+    'T' -> 'T', 'X' -> 'X', 'B' -> 'B' (cho cầu bệt)
+    'T' -> 'X', 'X' -> 'T' (cho cầu ziczac)
+    """
+    # Nếu là bệt T, X, B
+    if pattern.count('T') == len(pattern): return 'T'
+    if pattern.count('X') == len(pattern): return 'X'
+    if pattern.count('B') == len(pattern): return 'B'
+
+    # Nếu là ziczac
+    if len(pattern) >= 2 and pattern[-1] != pattern[-2]:
+        if pattern[-1] == 'T': return 'X'
+        if pattern[-1] == 'X': return 'T'
+    
+    # Mặc định, dự đoán ngược lại kết quả cuối cùng (nếu không phải bệt/ziczac rõ ràng)
+    if pattern[-1] == 'T': return 'X'
+    if pattern[-1] == 'X': return 'T'
+    return 'T' # Nếu là 'B' hoặc trường hợp khác, dự đoán T
+
 def make_prediction_for_game(game_name):
     """Đưa ra dự đoán cho phiên tiếp theo dựa trên các mẫu cầu đã học."""
     recent_history_tx = get_recent_history_tx(game_name, limit=CAU_MIN_LENGTH)
     
     if len(recent_history_tx) < CAU_MIN_LENGTH:
-        return "Chưa đủ lịch sử để dự đoán mẫu cầu.", "N/A"
+        return "Chưa đủ lịch sử để dự đoán mẫu cầu. Cần ít nhất 5 phiên gần nhất.", "N/A"
     
     current_cau_for_prediction = "".join(recent_history_tx[-CAU_MIN_LENGTH:])
     
@@ -247,22 +267,16 @@ def make_prediction_for_game(game_name):
     predicted_value = "N/A"
 
     if current_cau_for_prediction in CAU_DEP[game_name]:
-        predicted_value = current_cau_for_prediction[-1] 
+        predicted_value = pattern_to_prediction(current_cau_for_prediction)
         prediction_text += f"✅ Phát hiện mẫu cầu đẹp. Khả năng cao ra: **{predicted_value}**\n"
     elif current_cau_for_prediction in CAU_XAU[game_name]:
-        # Dự đoán ngược lại hoặc theo một logic khác cho cầu xấu
-        if current_cau_for_prediction[-1] == 'T': predicted_value = 'X'
-        elif current_cau_for_prediction[-1] == 'X': predicted_value = 'T'
-        else: predicted_value = 'T' # Nếu là 'B', dự đoán T
-        prediction_text += f"❌ Phát hiện mẫu cầu xấu. Khả năng cao ra: **{predicted_value}** (Dự đoán ngược)\n"
+        predicted_value = pattern_to_prediction(current_cau_for_prediction) # Vẫn dự đoán theo mẫu, nhưng đánh dấu là cầu xấu
+        prediction_text += f"❌ Phát hiện mẫu cầu xấu. Khả năng cao ra: **{predicted_value}** (Cẩn thận!)\n"
     else:
-        # Nếu không có trong cầu đẹp/xấu, dự đoán dựa trên xác suất hoặc xu hướng đơn giản
+        # Nếu không có trong cầu đẹp/xấu, dự đoán dựa trên xu hướng đơn giản
         prediction_text += "🧐 Chưa có mẫu cầu rõ ràng để dự đoán.\n"
-        # VD: Dự đoán ngược lại kết quả phiên cuối cùng
-        if recent_history_tx[-1] == 'T': predicted_value = 'X'
-        elif recent_history_tx[-1] == 'X': predicted_value = 'T'
-        else: predicted_value = 'T' # Nếu là 'B', dự đoán T
-        prediction_text += f"👉 Khả năng cao ra: **{predicted_value}** (Dựa trên phiên gần nhất)\n"
+        predicted_value = pattern_to_prediction(current_cau_for_prediction)
+        prediction_text += f"👉 Khả năng cao ra: **{predicted_value}** (Dựa trên xu hướng gần nhất)\n"
 
     return prediction_text, predicted_value
 
@@ -274,7 +288,7 @@ def process_game_api_fetch(game_name, config):
 
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status()
+        response.raise_for_status() # Sẽ raise HTTPError cho các mã lỗi 4xx/5xx
         data = response.json()
 
         # Giả định API trả về trực tiếp một đối tượng JSON với các khóa bạn cung cấp
@@ -326,6 +340,7 @@ def process_game_api_fetch(game_name, config):
                         bot.send_message(admin_id, full_message, parse_mode='Markdown')
                     except telebot.apihelper.ApiTelegramException as e:
                         print(f"LỖI: Không thể gửi tin nhắn đến admin {admin_id}: {e}")
+                        sys.stdout.flush()
                     
                 print(f"DEBUG: Đã xử lý và gửi thông báo cho {game_name_vi} phiên {phien}.")
                 sys.stdout.flush()
@@ -365,7 +380,9 @@ def run_web_server():
     port = int(os.environ.get('PORT', 5000))
     print(f"DEBUG: Starting Flask web server on port {port}")
     sys.stdout.flush()
-    app.run(host='0.0.0.0', port=port)
+    # Sử dụng `debug=False` trong môi trường production
+    # host='0.0.0.0' để server có thể truy cập được từ bên ngoài container
+    app.run(host='0.0.0.0', port=port, debug=False) 
 
 # --- Quản lý Key Truy Cập ---
 def generate_key(length_days):
@@ -490,8 +507,7 @@ def show_help(message):
         "--- Lệnh chung ---\n"
         "`/kichhoat <key_của_bạn>`: Kích hoạt key truy cập.\n"
         "`/kiemtrakey`: Kiểm tra trạng thái và thời hạn key của bạn.\n"
-        "`/du_doan <tên_game>`: Xem dự đoán cho game (ví dụ: `/du_doan luckywin`).\n"
-        "`/status_bot`: Xem trạng thái bot và thống kê mẫu cầu (chỉ admin).\n\n"
+        "`/du_doan <tên_game>`: Xem dự đoán cho game (ví dụ: `/du_doan luckywin`).\n\n"
     )
     
     if is_admin(message.chat.id):
@@ -499,6 +515,7 @@ def show_help(message):
             "--- 👑 Lệnh dành cho Admin 👑 ---\n"
             "👑 `/taokey <số_ngày>`: Tạo một key mới có thời hạn (ví dụ: `/taokey 30`).\n"
             "👑 `/keys`: Xem danh sách các key đã tạo.\n"
+            "👑 `/status_bot`: Xem trạng thái bot và thống kê mẫu cầu.\n"
             "👑 `/trichcau`: Trích xuất toàn bộ dữ liệu mẫu cầu đã học ra file TXT.\n"
             "👑 `/nhapcau`: Nhập lại dữ liệu mẫu cầu đã học từ file TXT bạn gửi lên.\n"
             "👑 `/reset_patterns`: Đặt lại toàn bộ mẫu cầu đã học (cần xác nhận).\n"
@@ -954,7 +971,13 @@ def start_bot_threads():
     # Bắt đầu bot lắng nghe tin nhắn
     print("Bot đang khởi động và sẵn sàng nhận lệnh...")
     sys.stdout.flush()
-    bot.polling(none_stop=True)
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        print(f"LỖI: Bot polling dừng đột ngột: {e}")
+        sys.stdout.flush()
+        # Trong môi trường Render, khi bot polling dừng, dịch vụ có thể sẽ dừng luôn.
+        # Render sẽ tự động thử khởi động lại nếu dịch vụ bị crash.
 
 if __name__ == "__main__":
     start_bot_threads()
