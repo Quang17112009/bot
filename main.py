@@ -208,8 +208,17 @@ def analyze_and_learn_patterns(game_name, history_results):
         return 
 
     # Tạm thời clear cache mẫu học để học lại với dữ liệu mới
-    LEARNED_PATTERNS[game_name]['dep'].clear()
-    LEARNED_PATTERNS[game_name]['xau'].clear()
+    # Nếu muốn giữ lại các mẫu đã học và chỉ cập nhật, bạn có thể bỏ dòng này
+    # Tuy nhiên, để đảm bảo tính nhất quán với dữ liệu lịch sử mới, 
+    # việc học lại thường là cần thiết.
+    # LEARNED_PATTERNS[game_name]['dep'].clear()
+    # LEARNED_PATTERNS[game_name]['xau'].clear()
+
+    # Để tối ưu, chỉ xóa và học lại các mẫu cũ nếu chúng không còn xuất hiện hoặc thay đổi
+    # Hiện tại giữ nguyên logic clear và học lại để đơn giản.
+
+    newly_learned_dep = {}
+    newly_learned_xau = {}
 
     for i in range(len(history_results) - CAU_MIN_LENGTH):
         current_sequence = "".join(history_results[i : i + CAU_MIN_LENGTH])
@@ -231,52 +240,66 @@ def analyze_and_learn_patterns(game_name, history_results):
         # Check for 1-2-1 (e.g., TXTTXT...) - Requires more complex logic
         # Simplified: Check if current_sequence matches a 1-2-1 pattern 
         # (e.g., TXT... if length is odd, TXTT... if length is even)
+        # A more robust 1-2-1 check would be: A B A B A B...
         elif 'B' not in current_sequence and CAU_MIN_LENGTH >= 3:
             is_121 = True
-            for j in range(len(current_sequence) - 2):
-                if current_sequence[j] == current_sequence[j+1] or current_sequence[j+1] == current_sequence[j+2]:
+            for j in range(len(current_sequence) - 1):
+                if current_sequence[j] == current_sequence[j+1]: # Should always alternate
                     is_121 = False
                     break
-            if is_121 and current_sequence[0] != current_sequence[1]: # Ensure it starts with alternating
+            if is_121:
                 pattern_type = '1-2-1'
                 predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
         
         # Check for 2-1-2 (e.g., TTXTTX...) - Simplified detection
-        elif 'B' not in current_sequence and CAU_MIN_LENGTH >= 4:
-            is_212 = True
-            # TTX TTX
-            # i   i+1 i+2 i+3
-            for j in range(len(current_sequence) - 2):
-                if not ((current_sequence[j] == current_sequence[j+1] and current_sequence[j+1] != current_sequence[j+2]) or \
-                        (current_sequence[j] != current_sequence[j+1] and current_sequence[j+1] == current_sequence[j+2])):
-                    is_212 = False
-                    break
-            if is_212 and current_sequence[0] == current_sequence[1] and current_sequence[1] != current_sequence[2]: # TTX
+        # A more robust 2-1-2 check would be: A A B A A B...
+        elif 'B' not in current_sequence and CAU_MIN_LENGTH >= 3: # Cần ít nhất 3 cho TTX
+            is_212 = False
+            # Check for TTX pattern (or XXT) repeating
+            if len(current_sequence) >= 3:
+                # Example: TTX, XXT
+                if (current_sequence[0] == current_sequence[1] and current_sequence[1] != current_sequence[2]) or \
+                   (current_sequence[0] != current_sequence[1] and current_sequence[1] == current_sequence[2]):
+                   # This is a starting segment, check if it continues
+                   is_212 = True
+                   segment_length = 3
+                   for k in range(segment_length, len(current_sequence), segment_length):
+                       if len(current_sequence) - k >= segment_length:
+                           if not (current_sequence[k] == current_sequence[k+1] and current_sequence[k+1] != current_sequence[k+2]) and \
+                              not (current_sequence[k] != current_sequence[k+1] and current_sequence[k+1] == current_sequence[k+2]):
+                               is_212 = False
+                               break
+                       else: # Remaining part is shorter than a full segment
+                           # Just check if it follows the pattern so far
+                           if current_sequence[k] != current_sequence[k-segment_length]: # if TTX... (T != X)
+                               is_212 = False
+                               break
+            
+            if is_212:
                  pattern_type = '2-1-2'
-                 predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
-            elif is_212 and current_sequence[0] != current_sequence[1] and current_sequence[1] == current_sequence[2]: # XTT
-                 pattern_type = '2-1-2'
-                 predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
+                 # Dự đoán tiếp theo của TTX sẽ là T, của XXT sẽ là X
+                 # Nghĩa là dự đoán giống với kết quả đầu tiên của segment tiếp theo
+                 predicted_result = current_sequence[0] 
+
 
         # Nếu tìm thấy một mẫu cầu được định nghĩa
         if predicted_result != 'N/A' and pattern_type != 'unknown':
             if actual_next_result == predicted_result:
                 # Nếu mẫu dự đoán đúng, thêm vào cầu đẹp
-                LEARNED_PATTERNS[game_name]['dep'][current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
-                # Xóa khỏi cầu xấu nếu nó từng ở đó
-                if current_sequence in LEARNED_PATTERNS[game_name]['xau']:
-                    del LEARNED_PATTERNS[game_name]['xau'][current_sequence]
+                newly_learned_dep[current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
             else:
                 # Nếu mẫu dự đoán sai, thêm vào cầu xấu
-                LEARNED_PATTERNS[game_name]['xau'][current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
-                # Xóa khỏi cầu đẹp nếu nó từng ở đó
-                if current_sequence in LEARNED_PATTERNS[game_name]['dep']:
-                    del LEARNED_PATTERNS[game_name]['dep'][current_sequence]
+                newly_learned_xau[current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
         
+    # Cập nhật LEARNED_PATTERNS với các mẫu mới học
+    LEARNED_PATTERNS[game_name]['dep'].update(newly_learned_dep)
+    LEARNED_PATTERNS[game_name]['xau'].update(newly_learned_xau)
+
     # Lưu lại toàn bộ các mẫu đã học vào DB
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM learned_patterns_db WHERE game_name = ?", (game_name,)) # Xóa cũ để cập nhật mới
+    # Xóa các mẫu cũ của game này trước khi thêm mới để tránh trùng lặp và cập nhật chính xác
+    cursor.execute("DELETE FROM learned_patterns_db WHERE game_name = ?", (game_name,))
     
     for pattern_seq, data in LEARNED_PATTERNS[game_name]['dep'].items():
         save_learned_pattern_to_db(game_name, data['type'], pattern_seq, 'dep', data['confidence'], None)
@@ -298,6 +321,10 @@ def make_prediction_for_game(game_name):
     confidence = "Thấp"
     
     # Lấy chuỗi lịch sử ngắn gọn để so khớp mẫu
+    # Đảm bảo đủ độ dài CAU_MIN_LENGTH để so khớp
+    if len(recent_history_tx) < CAU_MIN_LENGTH:
+        return None, "Không đủ lịch sử để phân tích mẫu.", "Rất thấp", ""
+
     current_sequence_for_match = "".join(recent_history_tx[-CAU_MIN_LENGTH:])
 
     # 1. Ưu tiên dựa trên MẪU CẦU ĐẸP
@@ -318,8 +345,9 @@ def make_prediction_for_game(game_name):
             reason = f"Theo cầu 1-2-1 dài {pattern_data['confidence']}+."
             confidence = "Cao"
         elif pattern_data['type'] == '2-1-2':
-            # TTX -> T, XXT -> X (Logic của 2-1-2 có thể phức tạp hơn tùy định nghĩa)
-            prediction = 'T' if current_sequence_for_match[-1] == 'X' else 'X' # Simple flip for now
+            # Dự đoán tiếp theo của TTX sẽ là T, của XXT sẽ là X
+            # Nghĩa là dự đoán giống với kết quả đầu tiên của segment tiếp theo
+            prediction = current_sequence_for_match[0]
             reason = f"Theo cầu 2-1-2 dài {pattern_data['confidence']}+."
             confidence = "Cao"
         
@@ -393,7 +421,7 @@ def format_prediction_message(game_name_vi, phien_id_next, prev_phien_id, prev_r
     )
     return message
 
-# --- Logic Xử lý Game (ĐÃ SỬA ĐỔI ĐỂ ĐỌC ĐỊNH DẠNG JSON MỚI CỦA BẠN) ---
+# --- Logic Xử lý Game (ĐÃ SỬA LỖI TUPLLE ASSIGNMENT) ---
 def process_game_api_fetch(game_name, config):
     """Kết nối API, xử lý dữ liệu phiên mới, lưu vào DB."""
     url = config['api_url']
@@ -411,24 +439,24 @@ def process_game_api_fetch(game_name, config):
         dice3 = None
         result_tx_from_api = ''
         
-        # Lấy thông tin phiên trước để gửi thông báo
-        last_phien_info_raw = get_recent_history(game_name, limit=1, include_phien=True)
-        prev_phien_id = last_phien_info_raw[0][0] if last_phien_info_raw else "N/A"
-        prev_result_tx = last_phien_info_raw[0][1] if last_phien_info_raw else "N/A"
-        
-        # Cần lấy thông tin chi tiết của phiên trước để hiển thị xúc xắc, tổng điểm
-        # Lấy bản ghi chi tiết của phiên cuối cùng
+        # --- Lấy thông tin phiên trước để hiển thị trong thông báo ---
+        # Lấy bản ghi chi tiết của phiên cuối cùng từ DB
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT total_point, dice1, dice2, dice3 FROM {config['history_table']} ORDER BY id DESC LIMIT 1")
-        last_full_history = cursor.fetchone()
+        cursor.execute(f"SELECT phien, total_point, dice1, dice2, dice3, result_tx FROM {config['history_table']} ORDER BY id DESC LIMIT 1")
+        last_full_history_record = cursor.fetchone()
         conn.close()
 
-        prev_dices = "N/A", "N/A", "N/A"
+        prev_phien_id = "N/A"
+        prev_result_tx = "N/A"
+        prev_dices = ("N/A", "N/A", "N/A")
         prev_total_point = "N/A"
 
-        if last_full_history:
-            prev_total_point, prev_dices[0], prev_dices[1], prev_dices[2] = last_full_history
+        if last_full_history_record:
+            prev_phien_id = last_full_history_record[0]
+            prev_total_point = last_full_history_record[1]
+            prev_dices = (last_full_history_record[2], last_full_history_record[3], last_full_history_record[4])
+            prev_result_tx = last_full_history_record[5]
         
         # --- Phân tích dữ liệu từ các API khác nhau ---
         if game_name == 'luckywin':
@@ -495,6 +523,7 @@ def process_game_api_fetch(game_name, config):
                 prediction, reason, confidence, current_sequence = make_prediction_for_game(game_name)
 
                 # Lấy lịch sử gần nhất để hiển thị trong tin nhắn (10-15 phiên)
+                # Lấy lại lịch sử sau khi đã lưu phiên mới để đảm bảo hiển thị đúng phiên mới
                 recent_history_for_msg = get_recent_history(game_name, limit=15, include_phien=True)
                 recent_history_formatted = [f"#{p[0]}:{p[1]}" for p in recent_history_for_msg]
                 
@@ -506,8 +535,8 @@ def process_game_api_fetch(game_name, config):
                     phien, # Luckywin Expect là số phiên tiếp theo, Hitclub/Sunwin Phien là phiên hiện tại
                     phien, # Dùng phien hiện tại làm prev_phien_id vì là phiên vừa kết thúc
                     result_tx_from_api, 
-                    [dice1, dice2, dice3], 
-                    total_point, 
+                    [dice1, dice2, dice3], # Dùng dice hiện tại vì nó là của phiên vừa kết thúc
+                    total_point,           # Dùng total_point hiện tại vì nó là của phiên vừa kết thúc
                     prediction, reason, confidence, recent_history_formatted
                 )
                 
@@ -523,7 +552,7 @@ def process_game_api_fetch(game_name, config):
                 sys.stdout.flush()
             # else: Phiên này đã được xử lý hoặc là phiên cũ hơn, không làm gì.
         else:
-            print(f"LỖI: Dữ liệu từ API {game_name_vi} không đầy đủ hoặc không hợp lệ: {data}")
+            print(f"LỖỖI: Dữ liệu từ API {game_name_vi} không đầy đủ hoặc không hợp lệ: {data}")
             sys.stdout.flush()
 
     except requests.exceptions.Timeout:
@@ -550,7 +579,10 @@ def check_apis_loop():
             last_phien = cursor.fetchone()
             if last_phien:
                 LAST_FETCHED_IDS[game_name] = last_phien[0]
-                print(f"DEBUG: {game_name_vi}: Đã khởi tạo LAST_FETCHED_IDS = {last_phien[0]}")
+                print(f"DEBUG: {game_name}: Đã khởi tạo LAST_FETCHED_IDS = {last_phien[0]}")
+                sys.stdout.flush()
+            else:
+                print(f"DEBUG: {game_name}: Chưa có dữ liệu trong DB, LAST_FETCHED_IDS = None")
                 sys.stdout.flush()
         except sqlite3.OperationalError:
             print(f"DEBUG: Bảng '{config['history_table']}' chưa tồn tại khi khởi tạo. Sẽ tạo khi lưu.")
@@ -780,24 +812,24 @@ def get_prediction_for_user(message):
         return
 
     # Để đưa ra dự đoán, cần lấy thông tin phiên cuối cùng đã lưu trong DB cho game đó
-    last_phien_info_raw = get_recent_history(matched_game_key, limit=1, include_phien=True)
-    if not last_phien_info_raw:
-        bot.reply_to(message, "Chưa có dữ liệu lịch sử cho game này để dự đoán. Vui lòng chờ bot thu thập thêm dữ liệu.")
-        return
-
-    prev_phien_id = last_phien_info_raw[0][0]
-    prev_result_tx = last_phien_info_raw[0][1]
-
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(f"SELECT total_point, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} WHERE phien = ?", (prev_phien_id,))
-    last_full_history = cursor.fetchone()
+    cursor.execute(f"SELECT phien, total_point, dice1, dice2, dice3, result_tx FROM {GAME_CONFIGS[matched_game_key]['history_table']} ORDER BY id DESC LIMIT 1")
+    last_full_history_record = cursor.fetchone()
     conn.close()
 
-    prev_dices = "N/A", "N/A", "N/A"
+    prev_phien_id = "N/A"
+    prev_result_tx = "N/A"
+    prev_dices = ("N/A", "N/A", "N/A")
     prev_total_point = "N/A"
-    if last_full_history:
-        prev_total_point, prev_dices[0], prev_dices[1], prev_dices[2] = last_full_history
+    if last_full_history_record:
+        prev_phien_id = last_full_history_record[0]
+        prev_total_point = last_full_history_record[1]
+        prev_dices = (last_full_history_record[2], last_full_history_record[3], last_full_history_record[4])
+        prev_result_tx = last_full_history_record[5]
+    else:
+        bot.reply_to(message, "Chưa có dữ liệu lịch sử cho game này để dự đoán. Vui lòng chờ bot thu thập thêm dữ liệu.")
+        return
     
     prediction, reason, confidence, _ = make_prediction_for_game(matched_game_key)
     
@@ -833,12 +865,16 @@ def show_status_bot(message):
     for game_name, config in GAME_CONFIGS.items():
         status_message += f"**{config['game_name_vi']}**:\n"
         
-        dep_count = len(LEARNED_PATTERNS.get(game_name, {}).get('dep', {}))
-        xau_count = len(LEARNED_PATTERNS.get(game_name, {}).get('xau', {}))
-        status_message += f"  - Mẫu cầu đẹp (trong RAM): {dep_count}\n"
-        status_message += f"  - Mẫu cầu xấu (trong RAM): {xau_count}\n"
-        total_dep_patterns += dep_count
-        total_xau_patterns += xau_count;
+        # Lấy số lượng từ DB để đảm bảo chính xác nhất
+        cursor.execute("SELECT COUNT(*) FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'dep'", (game_name,))
+        dep_count_db = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'xau'", (game_name,))
+        xau_count_db = cursor.fetchone()[0]
+
+        status_message += f"  - Mẫu cầu đẹp (trong DB): {dep_count_db}\n"
+        status_message += f"  - Mẫu cầu xấu (trong DB): {xau_count_db}\n"
+        total_dep_patterns += dep_count_db
+        total_xau_patterns += xau_count_db
 
         cursor.execute(f"SELECT COUNT(*) FROM {config['history_table']}")
         total_history = cursor.fetchone()[0]
@@ -854,7 +890,7 @@ def show_status_bot(message):
 
     conn.close()
 
-    status_message += f"**Tổng cộng các mẫu cầu đã học (từ RAM):**\n"
+    status_message += f"**Tổng cộng các mẫu cầu đã học (từ DB):**\n"
     status_message += f"  - Cầu đẹp: {total_dep_patterns}\n"
     status_message += f"  - Cầu xấu: {total_xau_patterns}\n\n"
     status_message += f"**Thống kê Key Truy Cập:**\n"
@@ -889,6 +925,7 @@ def confirm_reset_patterns(call):
         conn.commit()
         conn.close()
 
+        # Sau khi xóa DB, cũng clear biến global LEARNED_PATTERNS
         global LEARNED_PATTERNS
         LEARNED_PATTERNS = {game: {'dep': {}, 'xau': {}} for game in GAME_CONFIGS.keys()}
 
@@ -974,18 +1011,33 @@ def extract_cau_patterns(message):
     for game_name, config in GAME_CONFIGS.items():
         all_patterns_content += f"===== Mẫu cầu cho {config['game_name_vi']} =====\n\n"
         
-        dep_patterns = sorted(list(LEARNED_PATTERNS.get(game_name, {}).get('dep', {}).keys()))
-        xau_patterns = sorted(list(LEARNED_PATTERNS.get(game_name, {}).get('xau', {}).keys()))
+        # Tải từ DB để đảm bảo dữ liệu là mới nhất
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
+        dep_patterns_db = []
+        cursor.execute("SELECT result_sequence FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'dep'", (game_name,))
+        for row in cursor.fetchall():
+            dep_patterns_db.append(row[0])
+        dep_patterns_db.sort()
+
+        xau_patterns_db = []
+        cursor.execute("SELECT result_sequence FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'xau'", (game_name,))
+        for row in cursor.fetchall():
+            xau_patterns_db.append(row[0])
+        xau_patterns_db.sort()
+        
+        conn.close()
+
         all_patterns_content += "--- Cầu Đẹp ---\n"
-        if dep_patterns:
-            all_patterns_content += "\n".join(dep_patterns) + "\n\n"
+        if dep_patterns_db:
+            all_patterns_content += "\n".join(dep_patterns_db) + "\n\n"
         else:
             all_patterns_content += "Không có mẫu cầu đẹp.\n\n"
 
         all_patterns_content += "--- Cầu Xấu ---\n"
-        if xau_patterns:
-            all_patterns_content += "\n".join(xau_patterns) + "\n\n"
+        if xau_patterns_db:
+            all_patterns_content += "\n".join(xau_patterns_db) + "\n\n"
         else:
             all_patterns_content += "Không có mẫu cầu xấu.\n\n"
         
@@ -1043,49 +1095,53 @@ def handle_document_for_cau_patterns(message):
         with open(temp_file_path, 'wb') as f:
             f.write(downloaded_file)
 
-        new_cau_dep = {game: {} for game in GAME_CONFIGS.keys()} # Lưu dict {pattern_seq: {'type': ..., 'confidence': ...}}
+        # Khởi tạo các dict tạm để lưu mẫu mới đọc từ file
+        new_cau_dep = {game: {} for game in GAME_CONFIGS.keys()} 
         new_cau_xau = {game: {} for game in GAME_CONFIGS.keys()}
         current_game = None
-        current_section = None
+        current_section = None # 'dep' hoặc 'xau'
 
         with open(temp_file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("===== Mẫu cầu cho"):
                     for game_key, config in GAME_CONFIGS.items():
-                        if config['game_name_vi'] in line:
+                        if config['game_name_vi'] in line: # Tìm tên game tiếng Việt trong dòng
                             current_game = game_key
                             break
-                    current_section = None
+                    current_section = None # Reset section khi chuyển game
                 elif line == "--- Cầu Đẹp ---":
                     current_section = 'dep'
                 elif line == "--- Cầu Xấu ---":
                     current_section = 'xau'
                 elif line and current_game and current_section:
-                    if "Không có mẫu cầu" not in line:
-                        # Khi nhập, giả định confidence là CAU_MIN_LENGTH và type là 'manual_import' hoặc tính lại sau
+                    if "Không có mẫu cầu" not in line and not line.startswith("===") and not line.startswith("---"):
                         pattern_seq = line
-                        # Try to infer pattern type (basic)
+                        # Cố gắng suy luận lại loại mẫu khi nhập
                         pattern_type = 'manual_import'
                         if len(set(pattern_seq)) == 1:
                             pattern_type = f'bet_{pattern_seq[0]}'
                         elif len(pattern_seq) >= 2 and all(pattern_seq[j] != pattern_seq[j+1] for j in range(len(pattern_seq) - 1)):
                             pattern_type = f'zigzag_{pattern_seq[0]}{pattern_seq[1]}'
+                        elif len(pattern_seq) >= 3 and all(pattern_seq[j] != pattern_seq[j+1] for j in range(len(pattern_seq) - 1)): # 1-2-1
+                             pattern_type = '1-2-1'
+                        # Thêm logic cho 2-1-2 nếu cần, nhưng phức tạp hơn để suy luận từ chuỗi đơn giản
                         
                         if current_section == 'dep':
                             new_cau_dep[current_game][pattern_seq] = {'type': pattern_type, 'confidence': len(pattern_seq)}
                         elif current_section == 'xau':
                             new_cau_xau[current_game][pattern_seq] = {'type': pattern_type, 'confidence': len(pattern_seq)}
         
+        # Cập nhật biến global LEARNED_PATTERNS
         global LEARNED_PATTERNS
-        LEARNED_PATTERNS = {game: {'dep': {}, 'xau': {}} for game in GAME_CONFIGS.keys()}
-        LEARNED_PATTERNS[game_name]['dep'] = new_cau_dep[game_name]
-        LEARNED_PATTERNS[game_name]['xau'] = new_cau_xau[game_name]
+        for game_key in GAME_CONFIGS.keys():
+            LEARNED_PATTERNS[game_key]['dep'] = new_cau_dep.get(game_key, {})
+            LEARNED_PATTERNS[game_key]['xau'] = new_cau_xau.get(game_key, {})
         
         # Xóa tất cả các mẫu cũ trong DB và lưu lại các mẫu mới nhập
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM learned_patterns_db")
+        cursor.execute("DELETE FROM learned_patterns_db") # Xóa toàn bộ
         for g_name, data_types in LEARNED_PATTERNS.items():
             for c_type, patterns_dict in data_types.items():
                 for p_seq, p_data in patterns_dict.items():
