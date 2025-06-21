@@ -11,7 +11,7 @@ from flask import Flask, request
 
 # --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠY ĐÂY) ---
 # THAY THẾ 'YOUR_BOT_TOKEN_HERE' BẰNG TOKEN THẬT CỦA BẠN
-BOT_TOKEN = "8118428622:AAFR4sxqk20-TiDxPSzM74O7UYDbRz3anp8" 
+BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
 # THAY THẾ BẰNG ID ADMIN THẬT CỦA BẠN. Có thể có nhiều ID, cách nhau bởi dấu phẩy.
 ADMIN_IDS = [6915752059] # Ví dụ: [6915752059, 123456789]
 
