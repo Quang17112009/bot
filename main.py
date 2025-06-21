@@ -15,9 +15,6 @@ BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s"
 # THAY THẾ BẰNG ID ADMIN THẬT CỦA BẠN. Có thể có nhiều ID, cách nhau bởi dấu phẩy.
 ADMIN_IDS = [6915752059] # Ví dụ: [6915752059, 123456789]
 
-# URL cho Webhook (Cần thiết khi triển khai trên Render/Heroku)
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL') # Lấy từ biến môi trường
-
 DATA_FILE = 'user_data.json'
 CAU_PATTERNS_FILE = 'cau_patterns.json'
 CODES_FILE = 'codes.json'
@@ -38,7 +35,7 @@ GAME_CONFIGS = {
         "tx_history_length": 7,
         "refresh_interval": 10 # Khoảng thời gian (giây) giữa các lần kiểm tra API của game này
     },
-    "sunwin": { 
+    "sunwin": { # THÊM GAME SUNWIN
         "api_url": "https://wanglinapiws.up.railway.app/api/taixiu", # API của Sunwin
         "name": "Sunwin",
         "pattern_prefix": "S", 
@@ -49,7 +46,7 @@ GAME_CONFIGS = {
 
 # --- Khởi tạo Flask App và Telegram Bot ---
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False) # Important for webhook: set threaded=False
+bot = telebot.TeleBot(BOT_TOKEN)
 
 # Global flags và objects
 bot_enabled = True
@@ -80,11 +77,11 @@ def load_user_data():
         with open(DATA_FILE, 'r') as f:
             try:
                 user_data = json.load(f)
-                # Đảm bảo trường is_paused_prediction, subscribed_games, game_stats tồn tại cho các user cũ
+                # Đảm bảo các trường cần thiết tồn tại cho các user cũ
                 for user_id_str, user_info in user_data.items():
                     user_info.setdefault('is_paused_prediction', False)
-                    user_info.setdefault('subscribed_games', {game_id: False for game_id in GAME_CONFIGS.keys()})
-                    user_info.setdefault('game_stats', {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()})
+                    user_info.setdefault('subscribed_games', []) # Mặc định không đăng ký game nào
+                    user_info.setdefault('prediction_stats', {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()})
             except json.JSONDecodeError:
                 print(f"Lỗi đọc {DATA_FILE}. Khởi tạo lại dữ liệu người dùng.")
                 user_data = {}
@@ -246,7 +243,7 @@ def lay_du_lieu(game_id):
                 "Expect": data.get("data", {}).get("Expect"),
                 "OpenCode": data.get("data", {}).get("OpenCode")
             }
-        elif game_id == "hitclub" or game_id == "sunwin": 
+        elif game_id == "hitclub" or game_id == "sunwin": # Áp dụng chung logic cho Hit Club và Sunwin
             if not all(k in data for k in ["Phien", "Xuc_xac_1", "Xuc_xac_2", "Xuc_xac_3"]): 
                  print(f"DEBUG: Dữ liệu {config['name']} không đầy đủ: {data}")
                  return None
@@ -255,6 +252,7 @@ def lay_du_lieu(game_id):
             xuc_xac_2 = data.get("Xuc_xac_2")
             xuc_xac_3 = data.get("Xuc_xac_3")
 
+            # Đảm bảo các giá trị xúc xắc là số nguyên và không null
             if not all(isinstance(x, int) for x in [xuc_xac_1, xuc_xac_2, xuc_xac_3]):
                 print(f"DEBUG: Xúc xắc {config['name']} không phải số nguyên: {xuc_xac_1},{xuc_xac_2},{xuc_xac_3}")
                 return None
@@ -262,9 +260,9 @@ def lay_du_lieu(game_id):
             return {
                 "ID": data.get("Phien"), 
                 "Expect": data.get("Phien"),
-                "Xuc_xac_1": xuc_xac_1, 
-                "Xuc_xac_2": xuc_xac_2, 
-                "Xuc_xac_3": xuc_xac_3, 
+                "Xuc_xac_1": xuc_xac_1, # Giữ lại để debug nếu cần
+                "Xuc_xac_2": xuc_xac_2, # Giữ lại để debug nếu cần
+                "Xuc_xac_3": xuc_xac_3, # Giữ lại để debug nếu cần
                 "OpenCode": f"{xuc_xac_1},{xuc_xac_2},{xuc_xac_3}"
             }
         else:
@@ -294,6 +292,7 @@ def prediction_loop(stop_event: Event):
             current_game_state = game_states[game_id]
             current_time = time.time()
 
+            # Chỉ kiểm tra API nếu đã đủ thời gian refresh
             if current_time - current_game_state["last_checked_time"] < config["refresh_interval"]:
                 continue 
 
@@ -338,7 +337,7 @@ def prediction_loop(stop_event: Event):
 
                 # Tính next_expect tùy thuộc vào game_id
                 if game_id == "luckywin":
-                    next_expect = str(int(expect) + 1).zfill(len(str(expect))) # Đảm bảo giữ số chữ số
+                    next_expect = str(int(expect) + 1).zfill(len(str(expect))) # Đảm bảo giữ số lượng chữ số
                 elif game_id in ["hitclub", "sunwin"]: 
                     next_expect = str(int(expect) + 1) 
                 else:
@@ -363,38 +362,38 @@ def prediction_loop(stop_event: Event):
                 else:
                     ly_do = f"AI Dự đoán theo xí ngầu (chưa đủ lịch sử cầu {tx_history_length} ký tự)"
 
+                # Cập nhật mẫu cầu (chỉ khi đủ lịch sử)
                 if len(tx_history_for_game) == tx_history_length:
                     prediction_correct = (du_doan_cuoi_cung == "Tài" and ket_qua_tx == "Tài") or \
                                          (du_doan_cuoi_cung == "Xỉu" and ket_qua_tx == "Xỉu")
                     update_cau_patterns(game_id, current_cau_str, prediction_correct)
                     # print(f"DEBUG: Cập nhật mẫu cầu cho {game_id}: {current_cau_str}, Đúng: {prediction_correct}")
 
-                # Gửi tin nhắn dự đoán tới tất cả người dùng có quyền truy cập
-                # print(f"DEBUG: Gửi tin nhắn dự đoán cho {config['name']} - Phiên {next_expect} ({du_doan_cuoi_cung})...")
+                # Gửi tin nhắn dự đoán tới tất cả người dùng CÓ ĐĂNG KÝ nhận dự đoán cho game này
+                print(f"DEBUG: Gửi tin nhắn dự đoán cho {config['name']} - Phiên {next_expect} ({du_doan_cuoi_cung})...")
                 sent_count = 0
                 for user_id_str, user_info in list(user_data.items()): 
                     user_id = int(user_id_str)
                     
-                    # Kiểm tra xem người dùng đã tạm ngừng nhận dự đoán chưa
-                    if user_info.get('is_paused_prediction', False):
+                    # Kiểm tra xem người dùng đã tạm ngừng nhận dự đoán hoặc không đăng ký game này
+                    if user_info.get('is_paused_prediction', False) or (game_id not in user_info.get('subscribed_games', [])):
                         continue 
-
-                    # Kiểm tra xem người dùng có đăng ký nhận dự đoán cho game này không
-                    if not user_info.get('subscribed_games', {}).get(game_id, False):
-                        continue
 
                     is_sub, sub_message = check_subscription(user_id)
                     if is_sub:
                         # Cập nhật thống kê dự đoán
-                        user_info['game_stats'].setdefault(game_id, {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0})
-                        user_info['game_stats'][game_id]["total_predictions"] += 1
+                        user_stats = user_info.get('prediction_stats', {})
+                        game_stats = user_stats.setdefault(game_id, {"total": 0, "correct": 0, "wrong": 0})
+                        
+                        game_stats["total"] += 1
                         if (du_doan_cuoi_cung == "Tài" and ket_qua_tx == "Tài") or \
                            (du_doan_cuoi_cung == "Xỉu" and ket_qua_tx == "Xỉu"):
-                            user_info['game_stats'][game_id]["correct_predictions"] += 1
+                            game_stats["correct"] += 1
                         else:
-                            user_info['game_stats'][game_id]["incorrect_predictions"] += 1
+                            game_stats["wrong"] += 1
                         
-                        save_user_data(user_data) # Lưu lại stats sau mỗi lần gửi
+                        user_info['prediction_stats'] = user_stats # Cập nhật lại vào user_info
+                        save_user_data(user_data) # Lưu lại sau mỗi lần cập nhật thống kê
 
                         try:
                             prediction_message = (
@@ -410,13 +409,16 @@ def prediction_loop(stop_event: Event):
                             sent_count += 1
                         except telebot.apihelper.ApiTelegramException as e:
                             if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
-                                pass 
+                                print(f"User {user_id} đã chặn bot hoặc tài khoản bị hủy kích hoạt. Xóa khỏi danh sách theo dõi.")
+                                if user_id_str in user_data:
+                                    del user_data[user_id_str]
+                                    save_user_data(user_data)
                             else:
                                 print(f"Lỗi gửi tin nhắn cho user {user_id} (game {game_id}): {e}")
                         except Exception as e:
                             print(f"Lỗi không xác định khi gửi tin nhắn cho user {user_id} (game {game_id}): {e}")
                 
-                print(f"DEBUG: Đã gửi dự đoán cho {config['name']} tới {sent_count} người dùng.")
+                print(f"DEBUG: Đã gửi dự đoán cho {config['name']} tới {sent_count} người dùng đang theo dõi.")
                 print("-" * 50)
                 print(f"🎮 KẾT QUẢ VÀ DỰ ĐOÁN CHO {config['name']}")
                 print(f"Phiên hiện tại: `{expect}` | Kết quả: {ket_qua_tx} (Tổng: {tong})")
@@ -444,8 +446,8 @@ def send_welcome(message):
             'expiry_date': None,
             'is_ctv': False,
             'is_paused_prediction': False, # Mặc định không tạm ngừng
-            'subscribed_games': {game_id: False for game_id in GAME_CONFIGS.keys()}, # Mặc định không đăng ký game nào
-            'game_stats': {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()}
+            'subscribed_games': [], # Mặc định không đăng ký game nào
+            'prediction_stats': {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()}
         }
         save_user_data(user_data)
         bot.reply_to(message, 
@@ -454,9 +456,10 @@ def send_welcome(message):
                      parse_mode='Markdown')
     else:
         user_data[user_id]['username'] = username 
+        # Đảm bảo các trường mới tồn tại cho user cũ
         user_data[user_id].setdefault('is_paused_prediction', False) 
-        user_data[user_id].setdefault('subscribed_games', {game_id: False for game_id in GAME_CONFIGS.keys()})
-        user_data[user_id].setdefault('game_stats', {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()})
+        user_data[user_id].setdefault('subscribed_games', [])
+        user_data[user_id].setdefault('prediction_stats', {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()})
         save_user_data(user_data)
         bot.reply_to(message, "Bạn đã khởi động bot rồi. Dùng /help để xem các lệnh.")
 
@@ -471,22 +474,24 @@ def show_help(message):
         "🔸 `/gia`: Xem bảng giá dịch vụ.\n"
         "🔸 `/gopy <nội dung>`: Gửi góp ý/báo lỗi cho Admin.\n"
         "🔸 `/nap`: Hướng dẫn nạp tiền.\n"
-        "🔸 `/dudoan_luckywin`: Nhận dự đoán **Luckywin**.\n"
-        "🔸 `/dudoan_hitclub`: Nhận dự đoán **Hit Club**.\n"
-        "🔸 `/dudoan_sunwin`: Nhận dự đoán **Sunwin**.\n"
-        "🔸 `/thongke`: Xem thống kê dự đoán của bạn.\n" # Lệnh mới
-        "🔸 `/maucau [tên game]`: Hiển thị các mẫu cầu bot đã thu thập (ví dụ: `/maucau luckywin`)\n"
+        "🔸 `/dudoan_luckywin`: Bắt đầu nhận dự đoán từ bot (Luckywin).\n"
+        "🔸 `/dudoan_hitclub`: Bắt đầu nhận dự đoán từ bot (Hit Club).\n"
+        "🔸 `/dudoan_sunwin`: Bắt đầu nhận dự đoán từ bot (Sunwin).\n"
+        "🔸 `/stop_dudoan <tên game>`: Tạm ngừng nhận dự đoán cho game cụ thể. (ví dụ: `/stop_dudoan luckywin`)\n"
+        "🔸 `/continue_dudoan <tên game>`: Tiếp tục nhận dự đoán cho game cụ thể. (ví dụ: `/continue_dudoan hitclub`)\n"
+        "🔸 `/thongke`: Xem thống kê dự đoán của bạn.\n"
+        "🔸 `/maucau [tên game]`: Hiển thị các mẫu cầu bot đã thu thập (xấu/đẹp). (ví dụ: `/maucau luckywin` hoặc `/maucau hitclub`)\n"
         "🔸 `/code <mã_code>`: Nhập mã code để gia hạn tài khoản.\n"
-        "🔸 `/stop`: Tạm ngừng nhận **tất cả** dự đoán từ bot.\n"
-        "🔸 `/continue`: Tiếp tục nhận **tất cả** dự đoán từ bot.\n\n"
+        "🔸 `/stop_all`: Tạm ngừng nhận tất cả dự đoán từ bot.\n"
+        "🔸 `/continue_all`: Tiếp tục nhận tất cả dự đoán từ bot.\n\n"
     )
     
     if is_ctv(message.chat.id):
         help_text += (
             "**Lệnh Admin/CTV:**\n"
             "🔹 `/full <id>`: Xem thông tin người dùng (để trống ID để xem của bạn).\n"
-            "🔹 `/giahan <id> <số ngày/giờ>`: Gia hạn tài khoản người dùng. Ví dụ: `/giahan 12345 1 ngày`.\n"
-            "🔹 `/nhapcau <tên game>`: Nhập các mẫu cầu từ văn bản cho bot. (ví dụ: `/nhapcau luckywin`)\n\n"
+            "🔹 `/giahan <id> <số ngày/giờ>`: Gia hạn tài khoản người dùng. Ví dụ: `/giahan 12345 1 ngày` hoặc `/giahan 12345 24 giờ`.\n"
+            "🔹 `/nhapcau <tên game>`: Nhập các mẫu cầu từ văn bản cho bot. (ví dụ: `/nhapcau luckywin` sau đó gửi text)\n\n"
         )
     
     if is_admin(message.chat.id):
@@ -497,7 +502,7 @@ def show_help(message):
             "👑 `/tb <nội dung>`: Gửi thông báo đến tất cả người dùng.\n"
             "👑 `/tatbot <lý do>`: Tắt mọi hoạt động của bot dự đoán.\n"
             "👑 `/mokbot`: Mở lại hoạt động của bot dự đoán.\n"
-            "👑 `/taocode <giá trị> <ngày/giờ> <số lượng>`: Tạo mã code gia hạn. Ví dụ: `/taocode 1 ngày 5`.\n"
+            "👑 `/taocode <giá trị> <ngày/giờ> <số lượng>`: Tạo mã code gia hạn. Ví dụ: `/taocode 1 ngày 5` (tạo 5 code 1 ngày).\n"
         )
     
     bot.reply_to(message, help_text, parse_mode='Markdown')
@@ -558,10 +563,8 @@ def show_deposit_info(message):
     )
     bot.reply_to(message, deposit_text, parse_mode='Markdown')
 
-# Updated /dudoan to /dudoan_luckywin
-@bot.message_handler(commands=['dudoan_luckywin'])
-def start_prediction_luckywin_command(message):
-    game_id = "luckywin" 
+# Hàm chung để đăng ký nhận dự đoán cho một game
+def subscribe_game_predictions(message, game_id):
     user_id_str = str(message.chat.id)
     is_sub, sub_message = check_subscription(message.chat.id)
     
@@ -573,83 +576,86 @@ def start_prediction_luckywin_command(message):
         bot.reply_to(message, f"❌ Bot dự đoán hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
         return
 
-    user_data[user_id_str]['subscribed_games'][game_id] = True
-    save_user_data(user_data)
-        
-    bot.reply_to(message, f"✅ Bạn đã đăng ký nhận dự đoán cho **{GAME_CONFIGS[game_id]['name']}**.")
+    # Lấy thông tin user, đảm bảo đã khởi tạo
+    if user_id_str not in user_data:
+        user_data[user_id_str] = {
+            'username': message.from_user.username or message.from_user.first_name,
+            'expiry_date': None,
+            'is_ctv': False,
+            'is_paused_prediction': False,
+            'subscribed_games': [],
+            'prediction_stats': {g_id: {"total": 0, "correct": 0, "wrong": 0} for g_id in GAME_CONFIGS.keys()}
+        }
+
+    if game_id not in user_data[user_id_str]['subscribed_games']:
+        user_data[user_id_str]['subscribed_games'].append(game_id)
+        user_data[user_id_str]['is_paused_prediction'] = False # Nếu đăng ký game, bật lại nhận dự đoán chung
+        save_user_data(user_data)
+        bot.reply_to(message, f"✅ Bạn đã bắt đầu nhận dự đoán cho game **{GAME_CONFIGS[game_id]['name']}**.")
+    else:
+        bot.reply_to(message, f"✅ Bạn đã và đang nhận dự đoán cho game **{GAME_CONFIGS[game_id]['name']}** rồi.")
+
+@bot.message_handler(commands=['dudoan_luckywin'])
+def start_prediction_luckywin_command(message):
+    subscribe_game_predictions(message, "luckywin")
 
 @bot.message_handler(commands=['dudoan_hitclub'])
 def start_prediction_hitclub_command(message):
-    game_id = "hitclub" 
-    user_id_str = str(message.chat.id)
-    is_sub, sub_message = check_subscription(message.chat.id)
-    
-    if not is_sub:
-        bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin @heheviptool hoặc @Besttaixiu999 để được hỗ trợ.", parse_mode='Markdown')
-        return
-    
-    if not bot_enabled:
-        bot.reply_to(message, f"❌ Bot dự đoán hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
-        return
+    subscribe_game_predictions(message, "hitclub")
 
-    user_data[user_id_str]['subscribed_games'][game_id] = True
-    save_user_data(user_data)
-
-    bot.reply_to(message, f"✅ Bạn đã đăng ký nhận dự đoán cho **{GAME_CONFIGS[game_id]['name']}**.")
-
-@bot.message_handler(commands=['dudoan_sunwin']) 
+@bot.message_handler(commands=['dudoan_sunwin'])
 def start_prediction_sunwin_command(message):
-    game_id = "sunwin" 
+    subscribe_game_predictions(message, "sunwin")
+
+@bot.message_handler(commands=['stop_dudoan'])
+def stop_specific_predictions(message):
     user_id_str = str(message.chat.id)
-    is_sub, sub_message = check_subscription(message.chat.id)
-    
-    if not is_sub:
-        bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin @heheviptool hoặc @Besttaixiu999 để được hỗ trợ.", parse_mode='Markdown')
-        return
-    
-    if not bot_enabled:
-        bot.reply_to(message, f"❌ Bot dự đoán hiện đang tạm dừng bởi Admin. Lý do: `{bot_disable_reason}`", parse_mode='Markdown')
-        return
+    args = telebot.util.extract_arguments(message.text).split()
 
-    user_data[user_id_str]['subscribed_games'][game_id] = True
-    save_user_data(user_data)
-
-    bot.reply_to(message, f"✅ Bạn đã đăng ký nhận dự đoán cho **{GAME_CONFIGS[game_id]['name']}**.")
-
-@bot.message_handler(commands=['thongke'])
-def show_prediction_stats(message):
-    user_id_str = str(message.chat.id)
     if user_id_str not in user_data:
         bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
         return
 
-    user_stats = user_data[user_id_str].get('game_stats', {})
-    if not user_stats:
-        bot.reply_to(message, "Bạn chưa có thống kê dự đoán nào. Hãy đăng ký nhận dự đoán để bắt đầu!")
+    if not args or args[0].lower() not in GAME_CONFIGS:
+        bot.reply_to(message, "Vui lòng chỉ định tên game để tạm ngừng. Ví dụ: `/stop_dudoan luckywin`", parse_mode='Markdown')
+        return
+    
+    game_id = args[0].lower()
+    game_name = GAME_CONFIGS[game_id]['name']
+
+    if game_id in user_data[user_id_str].get('subscribed_games', []):
+        user_data[user_id_str]['subscribed_games'].remove(game_id)
+        save_user_data(user_data)
+        bot.reply_to(message, f"⏸️ Bạn đã tạm ngừng nhận dự đoán cho game **{game_name}**.")
+    else:
+        bot.reply_to(message, f"Bạn không đang nhận dự đoán cho game **{game_name}**.")
+
+@bot.message_handler(commands=['continue_dudoan'])
+def continue_specific_predictions(message):
+    user_id_str = str(message.chat.id)
+    args = telebot.util.extract_arguments(message.text).split()
+
+    if user_id_str not in user_data:
+        bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
         return
 
-    stats_text = "📊 **THỐNG KÊ DỰ ĐOÁN CỦA BẠN** 📊\n\n"
-    has_stats = False
-    for game_id, stats in user_stats.items():
-        if stats["total_predictions"] > 0:
-            has_stats = True
-            correct_percent = (stats["correct_predictions"] / stats["total_predictions"]) * 100 if stats["total_predictions"] > 0 else 0
-            stats_text += (
-                f"**{GAME_CONFIGS[game_id]['name']}**:\n"
-                f"  - Tổng số phiên dự đoán: `{stats['total_predictions']}`\n"
-                f"  - Đúng: `{stats['correct_predictions']}`\n"
-                f"  - Sai: `{stats['incorrect_predictions']}`\n"
-                f"  - Tỷ lệ đúng: `{correct_percent:.2f}%`\n\n"
-            )
+    if not args or args[0].lower() not in GAME_CONFIGS:
+        bot.reply_to(message, "Vui lòng chỉ định tên game để tiếp tục. Ví dụ: `/continue_dudoan luckywin`", parse_mode='Markdown')
+        return
     
-    if not has_stats:
-        bot.reply_to(message, "Bạn chưa có thống kê dự đoán nào. Hãy đăng ký nhận dự đoán để bắt đầu!")
+    game_id = args[0].lower()
+    game_name = GAME_CONFIGS[game_id]['name']
+
+    if game_id not in user_data[user_id_str].get('subscribed_games', []):
+        user_data[user_id_str]['subscribed_games'].append(game_id)
+        save_user_data(user_data)
+        bot.reply_to(message, f"▶️ Bạn đã tiếp tục nhận dự đoán cho game **{game_name}**.")
     else:
-        bot.reply_to(message, stats_text, parse_mode='Markdown')
+        bot.reply_to(message, f"Bạn đã và đang nhận dự đoán cho game **{game_name}** rồi.")
 
 
-@bot.message_handler(commands=['stop'])
-def stop_predictions(message):
+@bot.message_handler(commands=['stop_all'])
+def stop_all_predictions(message):
     user_id_str = str(message.chat.id)
     if user_id_str not in user_data:
         bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
@@ -657,10 +663,10 @@ def stop_predictions(message):
 
     user_data[user_id_str]['is_paused_prediction'] = True
     save_user_data(user_data)
-    bot.reply_to(message, "⏸️ Bạn đã tạm ngừng nhận **tất cả** dự đoán từ bot. Dùng `/continue` để tiếp tục.")
+    bot.reply_to(message, "⏸️ Bạn đã tạm ngừng nhận **tất cả** dự đoán từ bot. Dùng `/continue_all` để tiếp tục.")
 
-@bot.message_handler(commands=['continue'])
-def continue_predictions(message):
+@bot.message_handler(commands=['continue_all'])
+def continue_all_predictions(message):
     user_id_str = str(message.chat.id)
     if user_id_str not in user_data:
         bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
@@ -673,6 +679,46 @@ def continue_predictions(message):
     user_data[user_id_str]['is_paused_prediction'] = False
     save_user_data(user_data)
     bot.reply_to(message, "▶️ Bạn đã tiếp tục nhận **tất cả** dự đoán từ bot.")
+
+
+@bot.message_handler(commands=['thongke'])
+def show_prediction_stats(message):
+    user_id_str = str(message.chat.id)
+    if user_id_str not in user_data:
+        bot.reply_to(message, "Bạn chưa khởi động bot. Vui lòng dùng /start trước.")
+        return
+    
+    is_sub, sub_message = check_subscription(message.chat.id)
+    if not is_sub:
+        bot.reply_to(message, sub_message, parse_mode='Markdown')
+        return
+
+    stats = user_data[user_id_str].get('prediction_stats', {})
+    
+    stats_message = "📊 **THỐNG KÊ DỰ ĐOÁN CỦA BẠN** 📊\n\n"
+    
+    has_stats = False
+    for game_id, game_stats in stats.items():
+        game_name = GAME_CONFIGS.get(game_id, {}).get('name', game_id.capitalize())
+        total = game_stats.get('total', 0)
+        correct = game_stats.get('correct', 0)
+        wrong = game_stats.get('wrong', 0)
+        
+        if total > 0:
+            has_stats = True
+            accuracy = (correct / total) * 100 if total > 0 else 0
+            stats_message += (
+                f"**🎮 Game {game_name}:**\n"
+                f"   Tổng phiên: `{total}`\n"
+                f"   Đúng: `{correct}`\n"
+                f"   Sai: `{wrong}`\n"
+                f"   Tỷ lệ đúng: `{accuracy:.2f}%`\n\n"
+            )
+    
+    if not has_stats:
+        stats_message += "Bạn chưa nhận được dự đoán nào từ bot để thống kê."
+        
+    bot.reply_to(message, stats_message, parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['maucau'])
@@ -807,11 +853,18 @@ def use_code(message):
     elif code_info['type'] == 'giờ':
         new_expiry_date += timedelta(hours=value)
     
-    user_data.setdefault(user_id, {})['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
+    # Đảm bảo user_data[user_id] tồn tại và có các khóa cần thiết
+    if user_id not in user_data:
+        user_data[user_id] = {
+            'username': message.from_user.username or message.from_user.first_name,
+            'is_ctv': False,
+            'is_paused_prediction': False,
+            'subscribed_games': [],
+            'prediction_stats': {g_id: {"total": 0, "correct": 0, "wrong": 0} for g_id in GAME_CONFIGS.keys()}
+        }
+    
+    user_data[user_id]['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
     user_data[user_id]['username'] = message.from_user.username or message.from_user.first_name
-    user_data[user_id].setdefault('is_paused_prediction', False)
-    user_data[user_id].setdefault('subscribed_games', {game_id: False for game_id in GAME_CONFIGS.keys()})
-    user_data[user_id].setdefault('game_stats', {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()})
     
     GENERATED_CODES[code_str]['used_by'] = user_id
     GENERATED_CODES[code_str]['used_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -850,8 +903,8 @@ def get_user_info(message):
     username = user_info.get('username', 'Không rõ')
     is_ctv_status = "Có" if is_ctv(int(target_user_id_str)) else "Không"
     is_paused_status = "Có" if user_info.get('is_paused_prediction', False) else "Không"
-
-    subscribed_games_list = [GAME_CONFIGS[game_id]['name'] for game_id, subscribed in user_info.get('subscribed_games', {}).items() if subscribed]
+    
+    subscribed_games_list = [GAME_CONFIGS[g_id]['name'] for g_id in user_info.get('subscribed_games', []) if g_id in GAME_CONFIGS]
     subscribed_games_str = ", ".join(subscribed_games_list) if subscribed_games_list else "Không có"
 
     info_text = (
@@ -860,9 +913,29 @@ def get_user_info(message):
         f"**Tên:** @{username}\n"
         f"**Ngày hết hạn:** `{expiry_date_str}`\n"
         f"**Là CTV/Admin:** {is_ctv_status}\n"
-        f"**Tạm ngừng dự đoán:** {is_paused_status}\n"
-        f"**Đăng ký dự đoán:** {subscribed_games_str}"
+        f"**Tạm ngừng tất cả dự đoán:** {is_paused_status}\n"
+        f"**Đăng ký dự đoán game:** {subscribed_games_str}"
     )
+
+    stats = user_info.get('prediction_stats', {})
+    stats_detail = "\n\n**THỐNG KÊ DỰ ĐOÁN:**\n"
+    has_stats_detail = False
+    for game_id, game_stats in stats.items():
+        game_name = GAME_CONFIGS.get(game_id, {}).get('name', game_id.capitalize())
+        total = game_stats.get('total', 0)
+        correct = game_stats.get('correct', 0)
+        wrong = game_stats.get('wrong', 0)
+        if total > 0:
+            has_stats_detail = True
+            accuracy = (correct / total) * 100 if total > 0 else 0
+            stats_detail += (
+                f"   **{game_name}:** Tổng `{total}` | Đúng `{correct}` | Sai `{wrong}` | Tỷ lệ `{accuracy:.2f}%`\n"
+            )
+    if not has_stats_detail:
+        stats_detail += "   Chưa có thống kê."
+    
+    info_text += stats_detail
+
     bot.reply_to(message, info_text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['giahan'])
@@ -887,8 +960,8 @@ def extend_subscription(message):
             'expiry_date': None,
             'is_ctv': False,
             'is_paused_prediction': False, # Mặc định không tạm ngừng
-            'subscribed_games': {game_id: False for game_id in GAME_CONFIGS.keys()}, # Mặc định không đăng ký game nào
-            'game_stats': {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()}
+            'subscribed_games': [],
+            'prediction_stats': {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()}
         }
         bot.send_message(message.chat.id, f"Đã tạo tài khoản mới cho user ID `{target_user_id_str}`.")
 
@@ -909,10 +982,6 @@ def extend_subscription(message):
     
     user_data[target_user_id_str]['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
     user_data[target_user_id_str]['username'] = user_data[target_user_id_str].get('username', 'UnknownUser') 
-    user_data[target_user_id_str].setdefault('is_paused_prediction', False)
-    user_data[target_user_id_str].setdefault('subscribed_games', {game_id: False for game_id in GAME_CONFIGS.keys()})
-    user_data[target_user_id_str].setdefault('game_stats', {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()})
-    
     save_user_data(user_data)
     
     bot.reply_to(message, 
@@ -950,14 +1019,14 @@ def add_ctv(message):
             'expiry_date': None,
             'is_ctv': True,
             'is_paused_prediction': False, # Mặc định không tạm ngừng
-            'subscribed_games': {game_id: False for game_id in GAME_CONFIGS.keys()}, # Mặc định không đăng ký game nào
-            'game_stats': {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()}
+            'subscribed_games': [],
+            'prediction_stats': {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()}
         }
     else:
         user_data[target_user_id_str]['is_ctv'] = True
         user_data[target_user_id_str].setdefault('is_paused_prediction', False)
-        user_data[target_user_id_str].setdefault('subscribed_games', {game_id: False for game_id in GAME_CONFIGS.keys()})
-        user_data[target_user_id_str].setdefault('game_stats', {game_id: {"total_predictions": 0, "correct_predictions": 0, "incorrect_predictions": 0} for game_id in GAME_CONFIGS.keys()})
+        user_data[target_user_id_str].setdefault('subscribed_games', [])
+        user_data[target_user_id_str].setdefault('prediction_stats', {game_id: {"total": 0, "correct": 0, "wrong": 0} for game_id in GAME_CONFIGS.keys()})
     
     save_user_data(user_data)
     bot.reply_to(message, f"Đã cấp quyền CTV cho user ID `{target_user_id_str}`.")
@@ -1004,7 +1073,7 @@ def send_broadcast(message):
     fail_count = 0
     for user_id_str in list(user_data.keys()):
         try:
-            # Không gửi thông báo broadcast cho người dùng đã tạm ngừng dự đoán
+            # Không gửi thông báo broadcast cho người dùng đã tạm ngừng TẤT CẢ dự đoán
             if user_data[user_id_str].get('is_paused_prediction', False):
                 continue
             
@@ -1014,13 +1083,16 @@ def send_broadcast(message):
         except telebot.apihelper.ApiTelegramException as e:
             fail_count += 1
             if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
-                pass
+                print(f"User {user_id_str} đã chặn bot hoặc tài khoản bị hủy kích hoạt. Xóa khỏi danh sách theo dõi.")
+                if user_id_str in user_data:
+                    del user_data[user_id_str]
+                    save_user_data(user_data) # Lưu lại ngay sau khi xóa user
         except Exception as e:
             print(f"Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
             fail_count += 1
                 
     bot.reply_to(message, f"Đã gửi thông báo đến {success_count} người dùng. Thất bại: {fail_count}.")
-    save_user_data(user_data) 
+    save_user_data(user_data) # Lưu lại cuối cùng sau khi xử lý tất cả user
 
 @bot.message_handler(commands=['tatbot'])
 def disable_bot_command(message):
@@ -1115,16 +1187,6 @@ def home():
 def health_check():
     return "OK", 200
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        return 'Content-Type must be application/json', 403
-
 # --- Khởi tạo bot và các luồng khi Flask app khởi động ---
 @app.before_request
 def start_bot_threads():
@@ -1143,14 +1205,11 @@ def start_bot_threads():
             prediction_thread.start()
             print("Prediction loop thread started.")
 
-            # Set up webhook if URL is provided
-            if WEBHOOK_URL:
-                bot.remove_webhook()
-                time.sleep(1) # Give a moment for webhook to be removed
-                bot.set_webhook(url=WEBHOOK_URL + '/webhook')
-                print(f"Webhook set to: {WEBHOOK_URL}/webhook")
-            else:
-                print("WEBHOOK_URL not set. Bot will not use webhook.")
+            # Start bot polling in a separate thread
+            polling_thread = Thread(target=bot.infinity_polling, kwargs={'none_stop': True})
+            polling_thread.daemon = True
+            polling_thread.start()
+            print("Telegram bot polling thread started.")
             
             bot_initialized = True
 
@@ -1158,7 +1217,5 @@ def start_bot_threads():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"Starting Flask app locally on port {port}")
-    # In local development, you might still use bot.infinity_polling() if not deploying with webhook
-    # For deployment, remove debug=True and app.run() directly, let Gunicorn handle it.
     app.run(host='0.0.0.0', port=port, debug=True)
 
