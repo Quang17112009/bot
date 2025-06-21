@@ -7,7 +7,8 @@ from datetime import datetime, timedelta
 import os
 import sys
 import sqlite3
-import hashlib # Để tạo key ngẫu nhiên và an toàn hơn
+import hashlib 
+import re # Thêm import cho regex
 
 # Thêm import cho Flask và Thread
 from flask import Flask
@@ -32,12 +33,16 @@ GAME_CONFIGS = {
 }
 
 # --- Biến Toàn Cục và Cấu Hình Lưu Trữ ---
-LAST_FETCHED_IDS = {game: 0 for game in GAME_CONFIGS.keys()}
+LAST_FETCHED_IDS = {game: None for game in GAME_CONFIGS.keys()} # Lưu Expect string hoặc Phien int
 CHECK_INTERVAL_SECONDS = 5 # Kiểm tra API mỗi 5 giây
-CAU_DEP = {game: set() for game in GAME_CONFIGS.keys()}
-CAU_XAU = {game: set() for game in GAME_CONFIGS.keys()}
+
+# CAU_DEP và CAU_XAU sẽ lưu trữ các mẫu cầu đã học.
+# Format: {game_name: {pattern_string: confidence_or_length}}
+# 'confidence_or_length' có thể là độ dài của cầu đó hoặc một giá trị tin cậy khác.
+LEARNED_PATTERNS = {game: {'dep': {}, 'xau': {}} for game in GAME_CONFIGS.keys()} 
+
 CAU_MIN_LENGTH = 5 # Độ dài tối thiểu của mẫu cầu để phân loại
-RECENT_HISTORY_FETCH_LIMIT = 50 # Số phiên lịch sử gần nhất để lấy từ DB phục vụ việc học mẫu cầu
+RECENT_HISTORY_FETCH_LIMIT = 200 # Đã tăng lên 200 phiên để bot học nhiều hơn
 
 TEMP_DIR = 'temp_bot_files' # Thư mục để lưu file tạm thời
 DB_NAME = 'bot_data.db' # Tên file database SQLite
@@ -64,13 +69,17 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Bảng mẫu cầu
+    # Bảng mẫu cầu đã học
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS cau_patterns (
+        CREATE TABLE IF NOT EXISTS learned_patterns_db (
             game_name TEXT NOT NULL,
             pattern TEXT NOT NULL,
-            type TEXT NOT NULL, -- 'dep' or 'xau'
-            PRIMARY KEY (game_name, pattern, type)
+            pattern_type TEXT NOT NULL, -- e.g., 'bet_T', 'zigzag_TX', '1-2-1', 'statistical'
+            result_sequence TEXT NOT NULL, -- The sequence of T/X/B used to identify this pattern
+            classification_type TEXT NOT NULL, -- 'dep' or 'xau'
+            confidence REAL, -- A numerical value (e.g., length of pattern)
+            last_seen_phien TEXT,
+            PRIMARY KEY (game_name, pattern_type, result_sequence, classification_type)
         )
     ''')
 
@@ -79,7 +88,7 @@ def init_db():
         cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS {config['history_table']} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phien TEXT UNIQUE NOT NULL, -- Thay đổi thành TEXT để lưu Expect string
+                phien TEXT UNIQUE NOT NULL, -- Lưu số phiên hoặc Expect string
                 result_tx TEXT NOT NULL,
                 total_point INTEGER NOT NULL,
                 dice1 INTEGER NOT NULL,
@@ -106,48 +115,44 @@ def init_db():
 
 # --- Quản lý Mẫu Cầu (Sử dụng SQLite) ---
 def load_cau_patterns_from_db():
-    """Tải tất cả mẫu cầu từ database vào biến toàn cục CAU_DEP và CAU_XAU."""
+    """Tải tất cả mẫu cầu từ database vào biến toàn cục LEARNED_PATTERNS."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
     for game_name in GAME_CONFIGS.keys():
-        CAU_DEP[game_name].clear()
-        CAU_XAU[game_name].clear()
+        LEARNED_PATTERNS[game_name]['dep'].clear()
+        LEARNED_PATTERNS[game_name]['xau'].clear()
 
-        cursor.execute("SELECT pattern FROM cau_patterns WHERE game_name = ? AND type = 'dep'", (game_name,))
+        cursor.execute("SELECT pattern_type, result_sequence, confidence FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'dep'", (game_name,))
         for row in cursor.fetchall():
-            CAU_DEP[game_name].add(row[0])
+            LEARNED_PATTERNS[game_name]['dep'][row[1]] = {'type': row[0], 'confidence': row[2]} # Store result_sequence as key
         
-        cursor.execute("SELECT pattern FROM cau_patterns WHERE game_name = ? AND type = 'xau'", (game_name,))
+        cursor.execute("SELECT pattern_type, result_sequence, confidence FROM learned_patterns_db WHERE game_name = ? AND classification_type = 'xau'", (game_name,))
         for row in cursor.fetchall():
-            CAU_XAU[game_name].add(row[0])
+            LEARNED_PATTERNS[game_name]['xau'][row[1]] = {'type': row[0], 'confidence': row[2]} # Store result_sequence as key
             
     conn.close()
-    print(f"DEBUG: Đã tải mẫu cầu từ DB. Tổng cầu đẹp: {sum(len(v) for v in CAU_DEP.values())}, Tổng cầu xấu: {sum(len(v) for v in CAU_XAU.values())}")
+    print(f"DEBUG: Đã tải mẫu cầu từ DB. Tổng cầu đẹp: {sum(len(v['dep']) for v in LEARNED_PATTERNS.values())}, Tổng cầu xấu: {sum(len(v['xau']) for v in LEARNED_PATTERNS.values())}")
     sys.stdout.flush()
 
-def save_cau_patterns_to_db():
-    """Lưu tất cả mẫu cầu từ biến toàn cục CAU_DEP và CAU_XAU vào database."""
+def save_learned_pattern_to_db(game_name, pattern_type, result_sequence, classification_type, confidence, last_seen_phien):
+    """Lưu hoặc cập nhật một mẫu cầu đã học vào database."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Xóa tất cả mẫu cũ để tránh trùng lặp và cập nhật lại
-    cursor.execute("DELETE FROM cau_patterns")
-
-    # Thêm mẫu cầu đẹp
-    for game_name, patterns in CAU_DEP.items():
-        if patterns:
-            data = [(game_name, pattern, 'dep') for pattern in patterns]
-            cursor.executemany("INSERT INTO cau_patterns (game_name, pattern, type) VALUES (?, ?, ?)", data)
-    
-    # Thêm mẫu cầu xấu
-    for game_name, patterns in CAU_XAU.items():
-        if patterns:
-            data = [(game_name, pattern, 'xau') for pattern in patterns]
-            cursor.executemany("INSERT INTO cau_patterns (game_name, pattern, type) VALUES (?, ?, ?)", data)
-            
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute('''
+            INSERT INTO learned_patterns_db (game_name, pattern_type, result_sequence, classification_type, confidence, last_seen_phien)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(game_name, pattern_type, result_sequence, classification_type) DO UPDATE SET
+                confidence = EXCLUDED.confidence,
+                last_seen_phien = EXCLUDED.last_seen_phien
+        ''', (game_name, pattern_type, result_sequence, classification_type, confidence, last_seen_phien))
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving learned pattern to DB: {e}")
+        sys.stdout.flush()
+    finally:
+        conn.close()
 
 # --- Lịch sử Phiên Game (Sử dụng SQLite) ---
 def save_game_result(game_name, phien, result_tx, total_point, dice1, dice2, dice3):
@@ -163,125 +168,230 @@ def save_game_result(game_name, phien, result_tx, total_point, dice1, dice2, dic
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (phien, result_tx, total_point, dice1, dice2, dice3, timestamp))
         conn.commit()
+        return True # Trả về True nếu thêm mới thành công
     except sqlite3.IntegrityError:
-        pass # Phiên đã tồn tại, bỏ qua
+        return False # Phiên đã tồn tại, không thêm mới
     except Exception as e:
         print(f"LỖI: Không thể lưu kết quả phiên {phien} cho {game_name} vào DB: {e}")
         sys.stdout.flush()
+        return False
     finally:
         conn.close()
 
-def get_recent_history_tx(game_name, limit=RECENT_HISTORY_FETCH_LIMIT):
-    """Lấy N ký tự 'T', 'X', 'B' của các phiên gần nhất từ database, theo thứ tự cũ đến mới."""
+def get_recent_history(game_name, limit=RECENT_HISTORY_FETCH_LIMIT, include_phien=False):
+    """
+    Lấy N kết quả của các phiên gần nhất từ database.
+    Mặc định trả về list các chuỗi 'T', 'X', 'B'.
+    Nếu include_phien=True, trả về list các tuple (phien, result_tx).
+    """
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Order by phien DESC because phien can be string (for Luckywin 'Expect' field)
-    # This might not give perfectly sequential results if 'Expect' strings don't sort numerically,
-    # but for recent history, it should generally work by ordering the latest strings.
-    cursor.execute(f"SELECT result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
-    history = [row[0] for row in cursor.fetchall()]
+    
+    if include_phien:
+        cursor.execute(f"SELECT phien, result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
+        history = cursor.fetchall()
+    else:
+        cursor.execute(f"SELECT result_tx FROM {GAME_CONFIGS[game_name]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
+        history = [row[0] for row in cursor.fetchall()]
+    
     conn.close()
     return history[::-1] # Đảo ngược để có thứ tự từ cũ đến mới
 
 # --- Logic Học và Dự Đoán ---
-def classify_and_learn_cau(game_name):
+
+def analyze_and_learn_patterns(game_name, history_results):
     """
-    Học các mẫu cầu 'đẹp' hoặc 'xấu' dựa trên lịch sử phiên và lưu vào database.
-    Mẫu cầu được xem xét là chuỗi CAU_MIN_LENGTH ký tự ('T', 'X', 'B').
+    Phân tích các mẫu cầu (bệt, zigzag, 1-2-1, 2-1-2) từ lịch sử kết quả.
+    Lưu trữ vào LEARNED_PATTERNS và cập nhật DB.
     """
-    recent_history_tx = get_recent_history_tx(game_name, limit=RECENT_HISTORY_FETCH_LIMIT)
-    
-    if len(recent_history_tx) < CAU_MIN_LENGTH + 1:
+    if len(history_results) < CAU_MIN_LENGTH + 1:
         return 
-    
-    for i in range(len(recent_history_tx) - CAU_MIN_LENGTH):
-        pattern_to_classify = "".join(recent_history_tx[i : i + CAU_MIN_LENGTH])
-        actual_result_for_pattern = recent_history_tx[i + CAU_MIN_LENGTH]
 
-        is_bet = (pattern_to_classify.count('T') == CAU_MIN_LENGTH) or \
-                 (pattern_to_classify.count('X') == CAU_MIN_LENGTH) or \
-                 (pattern_to_classify.count('B') == CAU_MIN_LENGTH)
+    # Tạm thời clear cache mẫu học để học lại với dữ liệu mới
+    LEARNED_PATTERNS[game_name]['dep'].clear()
+    LEARNED_PATTERNS[game_name]['xau'].clear()
+
+    for i in range(len(history_results) - CAU_MIN_LENGTH):
+        current_sequence = "".join(history_results[i : i + CAU_MIN_LENGTH])
+        actual_next_result = history_results[i + CAU_MIN_LENGTH]
         
-        is_ziczac = True
-        for j in range(CAU_MIN_LENGTH - 1):
-            if pattern_to_classify[j] == pattern_to_classify[j+1]:
-                is_ziczac = False
-                break
+        pattern_type = 'unknown'
+        predicted_result = 'N/A'
         
-        # Đặc biệt xử lý trường hợp có 'B' (bão) xen kẽ, không coi là cầu bet hay ziczac thuần túy
-        if 'B' in pattern_to_classify and (pattern_to_classify.count('B') != CAU_MIN_LENGTH):
-            is_bet = False
-            is_ziczac = False 
+        # Check for bệt
+        if len(set(current_sequence)) == 1 and 'B' not in current_sequence: # Only T or X
+            pattern_type = f'bet_{current_sequence[0]}'
+            predicted_result = current_sequence[0]
+            
+        # Check for zigzag (TX, XT alternating)
+        elif 'B' not in current_sequence and all(current_sequence[j] != current_sequence[j+1] for j in range(CAU_MIN_LENGTH - 1)):
+            pattern_type = f'zigzag_{current_sequence[0]}{current_sequence[1]}'
+            predicted_result = 'T' if current_sequence[-1] == 'X' else 'X'
+        
+        # Check for 1-2-1 (e.g., TXTTXT...) - Requires more complex logic
+        # Simplified: Check if current_sequence matches a 1-2-1 pattern 
+        # (e.g., TXT... if length is odd, TXTT... if length is even)
+        elif 'B' not in current_sequence and CAU_MIN_LENGTH >= 3:
+            is_121 = True
+            for j in range(len(current_sequence) - 2):
+                if current_sequence[j] == current_sequence[j+1] or current_sequence[j+1] == current_sequence[j+2]:
+                    is_121 = False
+                    break
+            if is_121 and current_sequence[0] != current_sequence[1]: # Ensure it starts with alternating
+                pattern_type = '1-2-1'
+                predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
+        
+        # Check for 2-1-2 (e.g., TTXTTX...) - Simplified detection
+        elif 'B' not in current_sequence and CAU_MIN_LENGTH >= 4:
+            is_212 = True
+            # TTX TTX
+            # i   i+1 i+2 i+3
+            for j in range(len(current_sequence) - 2):
+                if not ((current_sequence[j] == current_sequence[j+1] and current_sequence[j+1] != current_sequence[j+2]) or \
+                        (current_sequence[j] != current_sequence[j+1] and current_sequence[j+1] == current_sequence[j+2])):
+                    is_212 = False
+                    break
+            if is_212 and current_sequence[0] == current_sequence[1] and current_sequence[1] != current_sequence[2]: # TTX
+                 pattern_type = '2-1-2'
+                 predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
+            elif is_212 and current_sequence[0] != current_sequence[1] and current_sequence[1] == current_sequence[2]: # XTT
+                 pattern_type = '2-1-2'
+                 predicted_result = 'T' if current_sequence[-1] == 'X' else 'X' # Dự đoán ngược lại
 
-        if is_bet:
-            expected_result = pattern_to_prediction(pattern_to_classify) # Dự đoán thẳng theo cầu bệt
-            if actual_result_for_pattern == expected_result:
-                if pattern_to_classify not in CAU_XAU[game_name]:
-                     CAU_DEP[game_name].add(pattern_to_classify)
+        # Nếu tìm thấy một mẫu cầu được định nghĩa
+        if predicted_result != 'N/A' and pattern_type != 'unknown':
+            if actual_next_result == predicted_result:
+                # Nếu mẫu dự đoán đúng, thêm vào cầu đẹp
+                LEARNED_PATTERNS[game_name]['dep'][current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
+                # Xóa khỏi cầu xấu nếu nó từng ở đó
+                if current_sequence in LEARNED_PATTERNS[game_name]['xau']:
+                    del LEARNED_PATTERNS[game_name]['xau'][current_sequence]
             else:
-                if pattern_to_classify in CAU_DEP[game_name]:
-                     CAU_DEP[game_name].remove(pattern_to_classify)
-                CAU_XAU[game_name].add(pattern_to_classify)
-        elif is_ziczac:
-            expected_result = pattern_to_prediction(pattern_to_classify) # Dự đoán thẳng theo cầu ziczac
-            if actual_result_for_pattern == expected_result:
-                if pattern_to_classify not in CAU_XAU[game_name]:
-                     CAU_DEP[game_name].add(pattern_to_classify)
-            else:
-                if pattern_to_classify in CAU_DEP[game_name]:
-                     CAU_DEP[game_name].remove(pattern_to_classify)
-                CAU_XAU[game_name].add(pattern_to_classify)
-        else:
-            pass # Hiện tại không phân loại các mẫu không rõ ràng
-
-    save_cau_patterns_to_db()
-
-def pattern_to_prediction(pattern):
-    """
-    Dự đoán kết quả tiếp theo dựa trên mẫu cầu.
-    'T' -> 'T', 'X' -> 'X', 'B' -> 'B' (cho cầu bệt)
-    'T' -> 'X', 'X' -> 'T' (cho cầu ziczac)
-    """
-    # Nếu là bệt T, X, B
-    if pattern.count('T') == len(pattern): return 'T'
-    if pattern.count('X') == len(pattern): return 'X'
-    if pattern.count('B') == len(pattern): return 'B'
-
-    # Nếu là ziczac
-    if len(pattern) >= 2 and pattern[-1] != pattern[-2]:
-        if pattern[-1] == 'T': return 'X'
-        if pattern[-1] == 'X': return 'T'
+                # Nếu mẫu dự đoán sai, thêm vào cầu xấu
+                LEARNED_PATTERNS[game_name]['xau'][current_sequence] = {'type': pattern_type, 'confidence': CAU_MIN_LENGTH}
+                # Xóa khỏi cầu đẹp nếu nó từng ở đó
+                if current_sequence in LEARNED_PATTERNS[game_name]['dep']:
+                    del LEARNED_PATTERNS[game_name]['dep'][current_sequence]
+        
+    # Lưu lại toàn bộ các mẫu đã học vào DB
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM learned_patterns_db WHERE game_name = ?", (game_name,)) # Xóa cũ để cập nhật mới
     
-    # Mặc định, dự đoán ngược lại kết quả cuối cùng (nếu không phải bệt/ziczac rõ ràng)
-    if pattern[-1] == 'T': return 'X'
-    if pattern[-1] == 'X': return 'T'
-    return 'T' # Nếu là 'B' hoặc trường hợp khác, dự đoán T
+    for pattern_seq, data in LEARNED_PATTERNS[game_name]['dep'].items():
+        save_learned_pattern_to_db(game_name, data['type'], pattern_seq, 'dep', data['confidence'], None)
+    for pattern_seq, data in LEARNED_PATTERNS[game_name]['xau'].items():
+        save_learned_pattern_to_db(game_name, data['type'], pattern_seq, 'xau', data['confidence'], None)
+    
+    conn.commit()
+    conn.close()
 
 def make_prediction_for_game(game_name):
-    """Đưa ra dự đoán cho phiên tiếp theo dựa trên các mẫu cầu đã học."""
-    recent_history_tx = get_recent_history_tx(game_name, limit=CAU_MIN_LENGTH)
+    """
+    Đưa ra dự đoán cho phiên tiếp theo dựa trên các mẫu cầu đã học và thống kê.
+    Ưu tiên mẫu cầu đẹp, sau đó đến thống kê.
+    """
+    recent_history_tx = get_recent_history(game_name, limit=RECENT_HISTORY_FETCH_LIMIT) # Lấy đủ lịch sử cho thống kê và mẫu dài
     
-    if len(recent_history_tx) < CAU_MIN_LENGTH:
-        return "Chưa đủ lịch sử để dự đoán mẫu cầu. Cần ít nhất 5 phiên gần nhất.", "N/A"
+    prediction = None
+    reason = "Không có mẫu rõ ràng."
+    confidence = "Thấp"
     
-    current_cau_for_prediction = "".join(recent_history_tx[-CAU_MIN_LENGTH:])
-    
-    prediction_text = f"📊 Mẫu cầu hiện tại: **{current_cau_for_prediction}**\n"
-    predicted_value = "N/A"
+    # Lấy chuỗi lịch sử ngắn gọn để so khớp mẫu
+    current_sequence_for_match = "".join(recent_history_tx[-CAU_MIN_LENGTH:])
 
-    if current_cau_for_prediction in CAU_DEP[game_name]:
-        predicted_value = pattern_to_prediction(current_cau_for_prediction)
-        prediction_text += f"✅ Phát hiện mẫu cầu đẹp. Khả năng cao ra: **{predicted_value}**\n"
-    elif current_cau_for_prediction in CAU_XAU[game_name]:
-        predicted_value = pattern_to_prediction(current_cau_for_prediction) # Vẫn dự đoán theo mẫu, nhưng đánh dấu là cầu xấu
-        prediction_text += f"❌ Phát hiện mẫu cầu xấu. Khả năng cao ra: **{predicted_value}** (Cẩn thận!)\n"
-    else:
-        # Nếu không có trong cầu đẹp/xấu, dự đoán dựa trên xu hướng đơn giản
-        prediction_text += "🧐 Chưa có mẫu cầu rõ ràng để dự đoán.\n"
-        predicted_value = pattern_to_prediction(current_cau_for_prediction)
-        prediction_text += f"👉 Khả năng cao ra: **{predicted_value}** (Dựa trên xu hướng gần nhất)\n"
+    # 1. Ưu tiên dựa trên MẪU CẦU ĐẸP
+    if current_sequence_for_match in LEARNED_PATTERNS[game_name]['dep']:
+        pattern_data = LEARNED_PATTERNS[game_name]['dep'][current_sequence_for_match]
+        
+        # Simple prediction based on pattern type
+        if pattern_data['type'].startswith('bet_'):
+            prediction = pattern_data['type'][-1] # T hoặc X
+            reason = f"Theo cầu bệt {prediction} dài {pattern_data['confidence']}+."
+            confidence = "Cao"
+        elif pattern_data['type'].startswith('zigzag_'):
+            prediction = 'T' if current_sequence_for_match[-1] == 'X' else 'X'
+            reason = f"Theo cầu zigzag dài {pattern_data['confidence']}+."
+            confidence = "Cao"
+        elif pattern_data['type'] == '1-2-1':
+            prediction = 'T' if current_sequence_for_match[-1] == 'X' else 'X'
+            reason = f"Theo cầu 1-2-1 dài {pattern_data['confidence']}+."
+            confidence = "Cao"
+        elif pattern_data['type'] == '2-1-2':
+            # TTX -> T, XXT -> X (Logic của 2-1-2 có thể phức tạp hơn tùy định nghĩa)
+            prediction = 'T' if current_sequence_for_match[-1] == 'X' else 'X' # Simple flip for now
+            reason = f"Theo cầu 2-1-2 dài {pattern_data['confidence']}+."
+            confidence = "Cao"
+        
+        return prediction, reason, confidence, current_sequence_for_match
+    
+    # 2. Nếu không có mẫu đẹp, kiểm tra MẪU CẦU XẤU
+    if current_sequence_for_match in LEARNED_PATTERNS[game_name]['xau']:
+        pattern_data = LEARNED_PATTERNS[game_name]['xau'][current_sequence_for_match]
+        prediction = 'N/A' # Khi cầu xấu, không nên dự đoán mà nên khuyên ngừng
+        reason = f"⚠️ Phát hiện mẫu cầu không ổn định: {pattern_data['type']}. Nên cân nhắc tạm dừng."
+        confidence = "Rất thấp"
+        return prediction, reason, confidence, current_sequence_for_match
+        
+    # 3. Nếu không có mẫu rõ ràng (đẹp/xấu), dựa vào THỐNG KÊ ĐƠN GIẢN
+    if len(recent_history_tx) >= 10: # Cần ít nhất 10 phiên cho thống kê
+        num_T = recent_history_tx.count('T')
+        num_X = recent_history_tx.count('X')
+        num_B = recent_history_tx.count('B')
+        
+        total_tx = num_T + num_X
+        if total_tx > 0:
+            ratio_T = num_T / total_tx
+            ratio_X = num_X / total_tx
 
-    return prediction_text, predicted_value
+            if ratio_T > 0.6: # Nếu Tài chiếm hơn 60%
+                prediction = 'T'
+                reason = f"Thống kê {num_T}/{total_tx} phiên gần nhất là Tài. Khả năng cao tiếp tục Tài."
+                confidence = "Trung bình"
+            elif ratio_X > 0.6: # Nếu Xỉu chiếm hơn 60%
+                prediction = 'X'
+                reason = f"Thống kê {num_X}/{total_tx} phiên gần nhất là Xỉu. Khả năng cao tiếp tục Xỉu."
+                confidence = "Trung bình"
+            elif num_B > 0 and num_B / len(recent_history_tx) > 0.05: # Nếu bão xuất hiện khá thường xuyên
+                prediction = 'B' # Có thể dự đoán bão
+                reason = f"Bão xuất hiện {num_B}/{len(recent_history_tx)} phiên gần nhất. Có thể bão tiếp."
+                confidence = "Trung bình"
+
+    # 4. Fallback: Nếu vẫn không có dự đoán, flip ngược lại kết quả cuối cùng
+    if not prediction and len(recent_history_tx) > 0:
+        last_result = recent_history_tx[-1]
+        prediction = 'T' if last_result == 'X' else 'X'
+        reason = f"Không có mẫu/thống kê rõ ràng. Dự đoán đảo ngược kết quả gần nhất ({last_result})."
+        confidence = "Thấp"
+    
+    return prediction, reason, confidence, current_sequence_for_match
+
+def format_prediction_message(game_name_vi, phien_id_next, prev_phien_id, prev_result, dices, total_point, prediction, reason, confidence, recent_history_formatted):
+    """Định dạng tin nhắn dự đoán cho Telegram."""
+    emoji_map = {
+        'T': '📈', 'X': '📉', 'B': '🌪️', 
+        'Cao': '🚀', 'Trung bình': '👍', 'Thấp': '🐌', 'Rất thấp': '🚨'
+    }
+    
+    prediction_emoji = emoji_map.get(prediction, '🤔')
+    confidence_emoji = emoji_map.get(confidence, '')
+
+    message = (
+        f"🎲 *Dự đoán {game_name_vi}* 🎲\n"
+        f"---\n"
+        f"✨ **Phiên hiện tại:** `# {phien_id_next}`\n"
+        f"➡️ **Kết quả phiên trước (`#{prev_phien_id}`):** [{dices[0]} {dices[1]} {dices[2]}] = **{total_point}** ({prev_result})\n"
+        f"---\n"
+        f"🎯 **Dự đoán:** {prediction_emoji} **{prediction or 'KHÔNG CHẮC CHẮN'}**\n"
+        f"💡 **Lý do:** _{reason}_\n"
+        f"📊 **Độ tin cậy:** {confidence_emoji} _{confidence}_\n"
+        f"---\n"
+        f"📈 **Lịch sử gần đây ({len(recent_history_formatted)} phiên):**\n"
+        f"`{' '.join(recent_history_formatted)}`\n"
+        f"\n"
+        f"⚠️ _Lưu ý: Dự đoán chỉ mang tính chất tham khảo, không đảm bảo 100% chính xác. Hãy chơi có trách nhiệm!_"
+    )
+    return message
 
 # --- Logic Xử lý Game (ĐÃ SỬA ĐỔI ĐỂ ĐỌC ĐỊNH DẠNG JSON MỚI CỦA BẠN) ---
 def process_game_api_fetch(game_name, config):
@@ -300,7 +410,27 @@ def process_game_api_fetch(game_name, config):
         dice2 = None
         dice3 = None
         result_tx_from_api = ''
+        
+        # Lấy thông tin phiên trước để gửi thông báo
+        last_phien_info_raw = get_recent_history(game_name, limit=1, include_phien=True)
+        prev_phien_id = last_phien_info_raw[0][0] if last_phien_info_raw else "N/A"
+        prev_result_tx = last_phien_info_raw[0][1] if last_phien_info_raw else "N/A"
+        
+        # Cần lấy thông tin chi tiết của phiên trước để hiển thị xúc xắc, tổng điểm
+        # Lấy bản ghi chi tiết của phiên cuối cùng
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT total_point, dice1, dice2, dice3 FROM {config['history_table']} ORDER BY id DESC LIMIT 1")
+        last_full_history = cursor.fetchone()
+        conn.close()
 
+        prev_dices = "N/A", "N/A", "N/A"
+        prev_total_point = "N/A"
+
+        if last_full_history:
+            prev_total_point, prev_dices[0], prev_dices[1], prev_dices[2] = last_full_history
+        
+        # --- Phân tích dữ liệu từ các API khác nhau ---
         if game_name == 'luckywin':
             # Specific parsing for Luckywin API response
             if data.get('state') == 1 and 'data' in data:
@@ -308,6 +438,7 @@ def process_game_api_fetch(game_name, config):
                 phien = game_data.get('Expect') # This is the "Phien" for Luckywin
                 open_code = game_data.get('OpenCode')
                 
+                # Luckywin thường không có 'Ket_qua' trực tiếp, phải tính từ OpenCode
                 if open_code:
                     try:
                         dices_str = open_code.split(',')
@@ -316,10 +447,20 @@ def process_game_api_fetch(game_name, config):
                             dice2 = int(dices_str[1])
                             dice3 = int(dices_str[2])
                             total_point = dice1 + dice2 + dice3
+                            if dice1 == dice2 == dice3:
+                                result_tx_from_api = 'B'
+                            elif total_point >= 11:
+                                result_tx_from_api = 'T'
+                            else:
+                                result_tx_from_api = 'X'
                     except ValueError:
-                        print(f"LỖI: OpenCode '{open_code}' không hợp lệ cho Luckywin.")
+                        print(f"LỖI: OpenCode '{open_code}' không hợp lệ cho Luckywin. Bỏ qua phiên này.")
                         sys.stdout.flush()
                         return
+                else:
+                    print(f"LỖI: Không tìm thấy 'OpenCode' trong dữ liệu Luckywin. Bỏ qua phiên này.")
+                    sys.stdout.flush()
+                    return
             else:
                 print(f"LỖI: Dữ liệu Luckywin không đúng định dạng mong đợi: {data}")
                 sys.stdout.flush()
@@ -334,49 +475,46 @@ def process_game_api_fetch(game_name, config):
             dice3 = data.get('Xuc_xac_3')
             result_tx_from_api = data.get('Ket_qua', '').upper() 
         
-        # Kiểm tra dữ liệu cần thiết
+        # --- Kiểm tra dữ liệu và xử lý phiên mới ---
         if phien is not None and total_point is not None and \
-           dice1 is not None and dice2 is not None and dice3 is not None:
+           dice1 is not None and dice2 is not None and dice3 is not None and \
+           result_tx_from_api in ['T', 'X', 'B']: # Đảm bảo có kết quả T/X/B hợp lệ
             
-            # For Luckywin, LAST_FETCHED_IDS will store the 'Expect' string.
-            # For Hitclub/Sunwin, it will store the 'Phien' integer.
-            # This comparison needs to be careful if phien is string vs int.
-            # A simple comparison like phien > LAST_FETCHED_IDS[game_name] works
-            # for integers. For strings, it compares lexicographically. 
-            # If Luckywin 'Expect' is strictly sequential like "2506211333", then
-            # lexicographical comparison should also work to detect new sessions.
-            if phien != LAST_FETCHED_IDS[game_name]: # Using != for string comparison
-                LAST_FETCHED_IDS[game_name] = phien
+            # So sánh với phiên cuối cùng đã xử lý (đây là điểm quan trọng để xác định phiên mới)
+            is_new_phien = save_game_result(game_name, phien, result_tx_from_api, total_point, dice1, dice2, dice3)
 
-                # Xác định result_tx. Ưu tiên Ket_qua từ API nếu hợp lệ, 
-                # nếu không thì tính toán từ tổng điểm và xúc xắc.
-                result_tx = ''
-                if result_tx_from_api in ['T', 'X', 'B']:
-                    result_tx = result_tx_from_api
-                else:
-                    # Tạo lại list dices để kiểm tra bão (nếu cần)
-                    dices = [dice1, dice2, dice3] 
-                    if dices[0] == dices[1] == dices[2]:
-                        result_tx = 'B'
-                    elif total_point >= 11:
-                        result_tx = 'T'
-                    else:
-                        result_tx = 'X'
-
-                save_game_result(game_name, phien, result_tx, total_point, dice1, dice2, dice3)
-                classify_and_learn_cau(game_name)
-
-                # Gửi thông báo kết quả phiên mới và dự đoán cho phiên tiếp theo đến Admin
-                prediction_message_part, _ = make_prediction_for_game(game_name)
+            if is_new_phien:
+                print(f"DEBUG: Đã lưu phiên mới: {game_name_vi} - Phiên {phien}, Kết quả: {result_tx_from_api}")
+                sys.stdout.flush()
                 
-                full_message = f"🔔 **{game_name_vi} - Phiên mới kết thúc!**\n\n"
-                full_message += prediction_message_part # Phần dự đoán
-                full_message += f"\n⚡ **Kết quả phiên {phien}**: "
-                full_message += f"[{dice1}] + [{dice2}] + [{dice3}] = **{total_point}** ({result_tx})"
+                # Sau khi lưu phiên mới, tiến hành học lại mẫu cầu với dữ liệu cập nhật
+                recent_history_tx_for_learning = get_recent_history(game_name, limit=RECENT_HISTORY_FETCH_LIMIT)
+                analyze_and_learn_patterns(game_name, recent_history_tx_for_learning)
                 
+                # Thực hiện dự đoán cho phiên tiếp theo
+                prediction, reason, confidence, current_sequence = make_prediction_for_game(game_name)
+
+                # Lấy lịch sử gần nhất để hiển thị trong tin nhắn (10-15 phiên)
+                recent_history_for_msg = get_recent_history(game_name, limit=15, include_phien=True)
+                recent_history_formatted = [f"#{p[0]}:{p[1]}" for p in recent_history_for_msg]
+                
+                # Gửi tin nhắn dự đoán
+                # phien_id_next là số phiên tiếp theo
+                # prev_phien_id, prev_result_tx, prev_dices, prev_total_point là thông tin của phiên vừa kết thúc
+                formatted_message = format_prediction_message(
+                    game_name_vi, 
+                    phien, # Luckywin Expect là số phiên tiếp theo, Hitclub/Sunwin Phien là phiên hiện tại
+                    phien, # Dùng phien hiện tại làm prev_phien_id vì là phiên vừa kết thúc
+                    result_tx_from_api, 
+                    [dice1, dice2, dice3], 
+                    total_point, 
+                    prediction, reason, confidence, recent_history_formatted
+                )
+                
+                # Gửi tới tất cả các admin
                 for admin_id in ADMIN_IDS:
                     try:
-                        bot.send_message(admin_id, full_message, parse_mode='Markdown')
+                        bot.send_message(admin_id, formatted_message, parse_mode='Markdown')
                     except telebot.apihelper.ApiTelegramException as e:
                         print(f"LỖI: Không thể gửi tin nhắn đến admin {admin_id}: {e}")
                         sys.stdout.flush()
@@ -385,14 +523,17 @@ def process_game_api_fetch(game_name, config):
                 sys.stdout.flush()
             # else: Phiên này đã được xử lý hoặc là phiên cũ hơn, không làm gì.
         else:
-            print(f"LỖI: Thiếu dữ liệu (Phien, Tong, Xuc_xac_1/2/3) từ API {game_name_vi} cho dữ liệu: {data}")
+            print(f"LỖI: Dữ liệu từ API {game_name_vi} không đầy đủ hoặc không hợp lệ: {data}")
             sys.stdout.flush()
 
+    except requests.exceptions.Timeout:
+        print(f"LỖI: Hết thời gian chờ khi kết nối đến API {game_name_vi}.")
+        sys.stdout.flush()
     except requests.exceptions.RequestException as e:
         print(f"LỖI: Không thể kết nối hoặc lấy dữ liệu từ {game_name_vi} API: {e}")
         sys.stdout.flush()
-    except json.JSONDecodeError as e:
-        print(f"LỖI: Không thể giải mã JSON từ {game_name_vi} API: {e}. Dữ liệu nhận được không phải JSON hợp lệ hoặc không đúng định dạng mong muốn.")
+    except json.JSONDecodeError:
+        print(f"LỖI: Phản hồi API {game_name_vi} không phải là JSON hợp lệ.")
         sys.stdout.flush()
     except Exception as e:
         print(f"LỖI: Xảy ra lỗi không xác định khi xử lý {game_name_vi}: {e}")
@@ -400,6 +541,26 @@ def process_game_api_fetch(game_name, config):
 
 def check_apis_loop():
     """Vòng lặp liên tục kiểm tra API của các game."""
+    # Khởi tạo LAST_FETCHED_IDS với phiên cuối cùng trong DB cho mỗi game khi bắt đầu loop
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    for game_name, config in GAME_CONFIGS.items():
+        try:
+            cursor.execute(f"SELECT phien FROM {config['history_table']} ORDER BY id DESC LIMIT 1")
+            last_phien = cursor.fetchone()
+            if last_phien:
+                LAST_FETCHED_IDS[game_name] = last_phien[0]
+                print(f"DEBUG: {game_name_vi}: Đã khởi tạo LAST_FETCHED_IDS = {last_phien[0]}")
+                sys.stdout.flush()
+        except sqlite3.OperationalError:
+            print(f"DEBUG: Bảng '{config['history_table']}' chưa tồn tại khi khởi tạo. Sẽ tạo khi lưu.")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"LỖI: Không thể khởi tạo LAST_FETCHED_IDS cho {game_name}: {e}")
+            sys.stdout.flush()
+    conn.close()
+
+
     while True:
         for game_name, config in GAME_CONFIGS.items():
             process_game_api_fetch(game_name, config)
@@ -416,7 +577,7 @@ def home():
 def run_web_server():
     """Chạy Flask web server trong một luồng riêng."""
     # Lấy cổng từ biến môi trường của Render
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000)) # Mặc định port 10000 nếu không tìm thấy biến môi trường PORT
     print(f"DEBUG: Starting Flask web server on port {port}")
     sys.stdout.flush()
     # Sử dụng `debug=False` trong môi trường production
@@ -618,9 +779,40 @@ def get_prediction_for_user(message):
         bot.reply_to(message, f"Không tìm thấy game: '{game_input}'. Các game hỗ trợ: {', '.join([config['game_name_vi'] for config in GAME_CONFIGS.values()])}")
         return
 
-    prediction_text, _ = make_prediction_for_game(matched_game_key)
-    bot.reply_to(message, f"**Dự đoán {GAME_CONFIGS[matched_game_key]['game_name_vi']} cho phiên tiếp theo:**\n\n{prediction_text}", parse_mode='Markdown')
+    # Để đưa ra dự đoán, cần lấy thông tin phiên cuối cùng đã lưu trong DB cho game đó
+    last_phien_info_raw = get_recent_history(matched_game_key, limit=1, include_phien=True)
+    if not last_phien_info_raw:
+        bot.reply_to(message, "Chưa có dữ liệu lịch sử cho game này để dự đoán. Vui lòng chờ bot thu thập thêm dữ liệu.")
+        return
 
+    prev_phien_id = last_phien_info_raw[0][0]
+    prev_result_tx = last_phien_info_raw[0][1]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT total_point, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} WHERE phien = ?", (prev_phien_id,))
+    last_full_history = cursor.fetchone()
+    conn.close()
+
+    prev_dices = "N/A", "N/A", "N/A"
+    prev_total_point = "N/A"
+    if last_full_history:
+        prev_total_point, prev_dices[0], prev_dices[1], prev_dices[2] = last_full_history
+    
+    prediction, reason, confidence, _ = make_prediction_for_game(matched_game_key)
+    
+    # Lấy lịch sử 15 phiên gần nhất để hiển thị
+    recent_history_for_msg = get_recent_history(matched_game_key, limit=15, include_phien=True)
+    recent_history_formatted = [f"#{p[0]}:{p[1]}" for p in recent_history_for_msg]
+
+    formatted_message = format_prediction_message(
+        GAME_CONFIGS[matched_game_key]['game_name_vi'], 
+        "Tiếp theo", # Hoặc bạn có thể tính phien_id_next nếu API cung cấp
+        prev_phien_id, prev_result_tx, prev_dices, prev_total_point, 
+        prediction, reason, confidence, recent_history_formatted
+    )
+    
+    bot.reply_to(message, formatted_message, parse_mode='Markdown')
 
 # Lệnh cũ /status đổi tên thành /status_bot để tránh nhầm lẫn và chỉ admin dùng
 @bot.message_handler(commands=['status_bot'])
@@ -641,10 +833,10 @@ def show_status_bot(message):
     for game_name, config in GAME_CONFIGS.items():
         status_message += f"**{config['game_name_vi']}**:\n"
         
-        dep_count = len(CAU_DEP.get(game_name, set()))
-        xau_count = len(CAU_XAU.get(game_name, set()))
-        status_message += f"  - Mẫu cầu đẹp: {dep_count}\n"
-        status_message += f"  - Mẫu cầu xấu: {xau_count}\n"
+        dep_count = len(LEARNED_PATTERNS.get(game_name, {}).get('dep', {}))
+        xau_count = len(LEARNED_PATTERNS.get(game_name, {}).get('xau', {}))
+        status_message += f"  - Mẫu cầu đẹp (trong RAM): {dep_count}\n"
+        status_message += f"  - Mẫu cầu xấu (trong RAM): {xau_count}\n"
         total_dep_patterns += dep_count
         total_xau_patterns += xau_count;
 
@@ -662,7 +854,7 @@ def show_status_bot(message):
 
     conn.close()
 
-    status_message += f"**Tổng cộng các mẫu cầu đã học (trong RAM):**\n"
+    status_message += f"**Tổng cộng các mẫu cầu đã học (từ RAM):**\n"
     status_message += f"  - Cầu đẹp: {total_dep_patterns}\n"
     status_message += f"  - Cầu xấu: {total_xau_patterns}\n\n"
     status_message += f"**Thống kê Key Truy Cập:**\n"
@@ -693,13 +885,12 @@ def confirm_reset_patterns(call):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM cau_patterns")
+        cursor.execute("DELETE FROM learned_patterns_db") # Xóa từ bảng mới
         conn.commit()
         conn.close()
 
-        global CAU_DEP, CAU_XAU
-        CAU_DEP = {game: set() for game in GAME_CONFIGS.keys()}
-        CAU_XAU = {game: set() for game in GAME_CONFIGS.keys()}
+        global LEARNED_PATTERNS
+        LEARNED_PATTERNS = {game: {'dep': {}, 'xau': {}} for game in GAME_CONFIGS.keys()}
 
         bot.answer_callback_query(call.id, "Đã reset toàn bộ mẫu cầu!")
         bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, 
@@ -751,7 +942,6 @@ def get_game_history(message):
     cursor = conn.cursor()
     
     try:
-        # Order by id DESC as phien can be string (for Luckywin 'Expect' field)
         cursor.execute(f"SELECT phien, total_point, result_tx, dice1, dice2, dice3 FROM {GAME_CONFIGS[matched_game_key]['history_table']} ORDER BY id DESC LIMIT ?", (limit,))
         history_records = cursor.fetchall()
         conn.close()
@@ -784,8 +974,8 @@ def extract_cau_patterns(message):
     for game_name, config in GAME_CONFIGS.items():
         all_patterns_content += f"===== Mẫu cầu cho {config['game_name_vi']} =====\n\n"
         
-        dep_patterns = sorted(list(CAU_DEP.get(game_name, set())))
-        xau_patterns = sorted(list(CAU_XAU.get(game_name, set())))
+        dep_patterns = sorted(list(LEARNED_PATTERNS.get(game_name, {}).get('dep', {}).keys()))
+        xau_patterns = sorted(list(LEARNED_PATTERNS.get(game_name, {}).get('xau', {}).keys()))
         
         all_patterns_content += "--- Cầu Đẹp ---\n"
         if dep_patterns:
@@ -853,8 +1043,8 @@ def handle_document_for_cau_patterns(message):
         with open(temp_file_path, 'wb') as f:
             f.write(downloaded_file)
 
-        new_cau_dep = {game: set() for game in GAME_CONFIGS.keys()}
-        new_cau_xau = {game: set() for game in GAME_CONFIGS.keys()}
+        new_cau_dep = {game: {} for game in GAME_CONFIGS.keys()} # Lưu dict {pattern_seq: {'type': ..., 'confidence': ...}}
+        new_cau_xau = {game: {} for game in GAME_CONFIGS.keys()}
         current_game = None
         current_section = None
 
@@ -873,15 +1063,35 @@ def handle_document_for_cau_patterns(message):
                     current_section = 'xau'
                 elif line and current_game and current_section:
                     if "Không có mẫu cầu" not in line:
+                        # Khi nhập, giả định confidence là CAU_MIN_LENGTH và type là 'manual_import' hoặc tính lại sau
+                        pattern_seq = line
+                        # Try to infer pattern type (basic)
+                        pattern_type = 'manual_import'
+                        if len(set(pattern_seq)) == 1:
+                            pattern_type = f'bet_{pattern_seq[0]}'
+                        elif len(pattern_seq) >= 2 and all(pattern_seq[j] != pattern_seq[j+1] for j in range(len(pattern_seq) - 1)):
+                            pattern_type = f'zigzag_{pattern_seq[0]}{pattern_seq[1]}'
+                        
                         if current_section == 'dep':
-                            new_cau_dep[current_game].add(line)
+                            new_cau_dep[current_game][pattern_seq] = {'type': pattern_type, 'confidence': len(pattern_seq)}
                         elif current_section == 'xau':
-                            new_cau_xau[current_game].add(line)
+                            new_cau_xau[current_game][pattern_seq] = {'type': pattern_type, 'confidence': len(pattern_seq)}
         
-        global CAU_DEP, CAU_XAU
-        CAU_DEP = new_cau_dep
-        CAU_XAU = new_cau_xau
-        save_cau_patterns_to_db()
+        global LEARNED_PATTERNS
+        LEARNED_PATTERNS = {game: {'dep': {}, 'xau': {}} for game in GAME_CONFIGS.keys()}
+        LEARNED_PATTERNS[game_name]['dep'] = new_cau_dep[game_name]
+        LEARNED_PATTERNS[game_name]['xau'] = new_cau_xau[game_name]
+        
+        # Xóa tất cả các mẫu cũ trong DB và lưu lại các mẫu mới nhập
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM learned_patterns_db")
+        for g_name, data_types in LEARNED_PATTERNS.items():
+            for c_type, patterns_dict in data_types.items():
+                for p_seq, p_data in patterns_dict.items():
+                    save_learned_pattern_to_db(g_name, p_data['type'], p_seq, c_type, p_data['confidence'], None)
+        conn.commit()
+        conn.close()
 
         bot.reply_to(message, "✅ Đã tải lại dữ liệu mẫu cầu thành công từ file của bạn!")
         print(f"DEBUG: Đã tải lại mẫu cầu từ file '{message.document.file_name}'.")
@@ -992,7 +1202,7 @@ def start_bot_threads():
     """Khởi tạo database, tải mẫu cầu và bắt đầu các luồng xử lý bot."""
     # Khởi tạo Database và tải mẫu cầu khi bot khởi động
     init_db()
-    load_cau_patterns_from_db()
+    load_cau_patterns_from_db() # Tải mẫu cầu đã học vào bộ nhớ
 
     # Khởi tạo luồng web server cho Render (keep-alive)
     web_server_thread = Thread(target=run_web_server)
