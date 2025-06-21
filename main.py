@@ -26,9 +26,9 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Nếu các URL này không trả về định dạng JSON hợp lệ hoặc không đúng như mong đợi, 
 # bạn cần thay đổi chúng sang các API tương ứng hoặc điều chỉnh phần xử lý JSON.
 GAME_CONFIGS = {
-    'luckywin': {'api_url': 'https://luckywin01.com/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Luckywin', 'history_table': 'luckywin_history'},
-    'hitclub': {'api_url': 'https://apphit.club/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Hit Club', 'history_table': 'hitclub_history'},
-    'sunwin': {'api_url': 'https://sunwin.ist/api/web/getLogs?game_code=TAIXIU', 'game_name_vi': 'Sunwin', 'history_table': 'sunwin_history'}
+    'luckywin': {'api_url': 'https://1.bot/GetNewLottery/LT_Taixiu', 'game_name_vi': 'Luckywin', 'history_table': 'luckywin_history'},
+    'hitclub': {'api_url': 'https://apihitclub.up.railway.app/api/taixiu', 'game_name_vi': 'Hit Club', 'history_table': 'hitclub_history'},
+    'sunwin': {'api_url': 'https://wanglinapiws.up.railway.app/api/taixiu', 'game_name_vi': 'Sunwin', 'history_table': 'sunwin_history'}
 }
 
 # --- Biến Toàn Cục và Cấu Hình Lưu Trữ ---
