@@ -11,7 +11,7 @@ from threading import Thread, Event, Lock
 
 from flask import Flask, request
 
-# --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠI ĐÂY) ---
+# --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠY ĐÂY) ---
 BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
 ADMIN_IDS = [6915752059] 
 
@@ -90,6 +90,8 @@ def load_cau_patterns():
     sys.stdout.flush()
 
 def save_cau_patterns():
+    # This function is retained but will not be called for dynamic learning anymore.
+    # It might be used if patterns are manually updated by an admin command in the future.
     try:
         with open(CAU_PATTERNS_FILE, 'w') as f:
             json.dump({'dep': list(CAU_DEP), 'xau': list(CAU_XAU)}, f, indent=4)
@@ -158,20 +160,15 @@ def tinh_tai_xiu(dice):
     return "Tài" if total >= 11 else "Xỉu", total
 
 def du_doan_theo_xi_ngau_va_lich_su(dice_list, tx_history):
-    # dice_list should be recent dice results (e.g., last 20)
-    # tx_history should be 'T' or 'X' for recent results
-
     if not dice_list:
         return "Đợi thêm dữ liệu", "Không đủ dữ liệu xúc xắc để dự đoán."
 
-    # --- Prediction based on the latest dice ---
     d1, d2, d3 = dice_list[-1]
     total = d1 + d2 + d3
 
     result_list = []
     for d in [d1, d2, d3]:
         tmp = d + total
-        # Điều chỉnh lại logic tmp nếu cần, giữ theo logic cũ của bạn
         if tmp in [4, 5]:
             tmp -= 4
         elif tmp >= 6:
@@ -181,61 +178,40 @@ def du_doan_theo_xi_ngau_va_lich_su(dice_list, tx_history):
     primary_prediction = max(set(result_list), key=result_list.count)
 
     # --- Enhance prediction using historical patterns (last 20 sessions) ---
-    # Start considering patterns after at least 5 sessions for meaningful patterns
+    # Focus on the latest patterns from 5 to 20 sessions for analysis
     if len(tx_history) >= 5: 
-        # Check various lengths of recent patterns from 5 up to 20
-        # Iterate from longest pattern to shortest for stronger matches first
-        for length in range(min(len(tx_history), 20), 4, -1): # From min(current_len, 20) down to 5
+        for length in range(min(len(tx_history), 20), 4, -1):
             current_cau_pattern = ''.join(tx_history[-length:])
             
             if is_cau_dep(current_cau_pattern):
                 return primary_prediction, f"AI Cầu đẹp ({current_cau_pattern}) → Giữ nguyên kết quả"
             elif is_cau_xau(current_cau_pattern):
-                # Reverse prediction if it's a "bad" pattern
                 reversed_prediction = "Xỉu" if primary_prediction == "Tài" else "Tài"
                 return reversed_prediction, f"AI Cầu xấu ({current_cau_pattern}) → Đảo chiều kết quả"
     
     return primary_prediction, "AI Dự đoán theo xí ngầu (chưa đủ hoặc không rõ mẫu cầu)"
 
 
-# --- Cập nhật mẫu cầu động ---
-def update_cau_patterns(new_cau, prediction_correct):
-    global CAU_DEP, CAU_XAU
-    if prediction_correct:
-        CAU_DEP.add(new_cau)
-        if new_cau in CAU_XAU:
-            CAU_XAU.remove(new_cau)
-            print(f"DEBUG: Xóa mẫu cầu '{new_cau}' khỏi cầu xấu.")
-    else:
-        CAU_XAU.add(new_cau)
-        if new_cau in CAU_DEP:
-            CAU_DEP.remove(new_cau)
-            print(f"DEBUG: Xóa mẫu cầu '{new_cau}' khỏi cầu đẹp.")
-    save_cau_patterns()
-    sys.stdout.flush()
-
+# Dynamic pattern learning removed - these functions are now simply checkers
 def is_cau_xau(cau_str):
     return cau_str in CAU_XAU
 
 def is_cau_dep(cau_str):
-    return cau_str in CAU_DEP and cau_str not in CAU_XAU # Đảm bảo không trùng cầu xấu
+    return cau_str in CAU_DEP and cau_str not in CAU_XAU
 
 # --- Lấy dữ liệu từ API ---
 def lay_du_lieu():
     try:
-        # Thay thế bằng URL API THỰC TẾ của bạn
-        # Dựa trên định dạng JSON bạn cung cấp, API của bạn có thể trả về dữ liệu trực tiếp mà không cần đường dẫn phụ
         response = requests.get("https://1.bot/GetNewLottery/LT_Taixiu", timeout=10) 
         response.raise_for_status() 
         data = response.json()
         
-        # Kiểm tra cấu trúc JSON bạn đã cung cấp: {"state":1,"data":{...}}
         if data.get("state") != 1 or "data" not in data:
             print(f"DEBUG: API trả về state không thành công hoặc thiếu trường 'data': {data.get('state')} cho {response.url}. Phản hồi đầy đủ: {data}")
             sys.stdout.flush()
             return None
         
-        actual_data = data.get("data") # Lấy phần 'data' bên trong JSON
+        actual_data = data.get("data")
         
         if not all(k in actual_data for k in ["ID", "Expect", "OpenCode"]):
             print(f"DEBUG: Dữ liệu API trong trường 'data' không đầy đủ (thiếu ID, Expect, hoặc OpenCode). Dữ liệu: {actual_data}")
@@ -244,7 +220,7 @@ def lay_du_lieu():
 
         print(f"DEBUG: Data fetched from API ({response.url}): {data}")
         sys.stdout.flush()
-        return actual_data # Trả về phần actual_data để xử lý
+        return actual_data
 
     except requests.exceptions.Timeout:
         print(f"LỖI: Hết thời gian chờ khi lấy dữ liệu từ API: {response.url}")
@@ -291,12 +267,10 @@ def prediction_loop(stop_event: Event):
             time.sleep(5)
             continue
 
-        # Đảm bảo lấy đúng các trường từ `actual_data` đã được trả về từ `lay_du_lieu()`
         issue_id = data.get("ID")
         expect = data.get("Expect")
         open_code = data.get("OpenCode")
 
-        # Kiểm tra lại một lần nữa để đảm bảo dữ liệu cần thiết không bị None
         if not all([issue_id, expect, open_code]):
             print(f"LOG: Dữ liệu API không đầy đủ (thiếu ID, Expect, hoặc OpenCode) cho phiên {expect}. Bỏ qua phiên này. Dữ liệu: {data}")
             sys.stdout.flush()
@@ -332,26 +306,10 @@ def prediction_loop(stop_event: Event):
                 dice_history.pop(0)
             dice_history.append(dice)
 
-
             next_expect = str(int(expect) + 1).zfill(len(expect))
             
-            # Use the enhanced prediction function
             du_doan, ly_do = du_doan_theo_xi_ngau_va_lich_su(dice_history, tx_history)
             
-            # --- Dynamic pattern learning based on the actual result ---
-            if len(tx_history) >= 5: 
-                # For pattern learning, consider a range of pattern lengths from 5 to 20
-                for length in range(5, min(len(tx_history) + 1, 21)):
-                    current_learning_cau = ''.join(tx_history[-length:])
-                    # Logic để xác định prediction_correct cần dùng `du_doan` (dự đoán của bot) 
-                    # và `ket_qua_tx` (kết quả thực tế của phiên vừa qua)
-                    prediction_correct = (du_doan == "Tài" and ket_qua_tx == "Tài") or \
-                                         (du_doan == "Xỉu" and ket_qua_tx == "Xỉu")
-                    update_cau_patterns(current_learning_cau, prediction_correct)
-                    print(f"DEBUG: Cập nhật mẫu cầu: '{current_learning_cau}' (length {length}) - Chính xác: {prediction_correct}")
-                    sys.stdout.flush()
-
-
             # Gửi tin nhắn dự đoán tới tất cả người dùng có quyền truy cập
             for user_id_str, user_info in list(user_data.items()): 
                 user_id = int(user_id_str)
@@ -376,9 +334,6 @@ def prediction_loop(stop_event: Event):
                         if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
                             print(f"CẢNH BÁO: Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa. Có thể xem xét xóa khỏi danh sách.")
                             sys.stdout.flush()
-                            # if user_id_str in user_data:
-                            #     del user_data[user_id_str] 
-                            #     save_user_data(user_data)
                     except Exception as e:
                         print(f"LỖI: Lỗi không xác định khi gửi tin nhắn cho user {user_id}: {e}")
                         sys.stdout.flush()
@@ -539,7 +494,7 @@ def show_cau_patterns(message):
         f"```\n{dep_patterns}\n```\n\n"
         "**🔴 Cầu Xấu:**\n"
         f"```\n{xau_patterns}\n```\n"
-        "*(Các mẫu cầu này được bot tự động học hỏi theo thời gian.)*"
+        "*(Các mẫu cầu này được bot sử dụng để dự đoán.)*"
     )
     bot.reply_to(message, pattern_text, parse_mode='Markdown')
 
@@ -900,3 +855,4 @@ if __name__ == '__main__':
     print(f"LOG: Khởi động Flask app trên cổng {port}")
     sys.stdout.flush()
     app.run(host='0.0.0.0', port=port, debug=False)
+
