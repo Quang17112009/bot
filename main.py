@@ -5,17 +5,15 @@ import json
 import os
 import random
 import string
-import sys # Import sys for stdout.flush for immediate log output
+import sys 
 from datetime import datetime, timedelta
 from threading import Thread, Event, Lock
 
 from flask import Flask, request
 
 # --- Cấu hình Bot (ĐẶT TRỰC TIẾP TẠI ĐÂY) ---
-# THAY THẾ 'YOUR_BOT_TOKEN_HERE' BẰNG TOKEN THẬT CỦA BẠN
 BOT_TOKEN = "7820739987:AAE_eU2JPZH7u6KnDRq31_l4tn64AD_8f6s" 
-# THAY THẾ BẰNG ID ADMIN THẬT CỦA BẠN. Có thể có nhiều ID, cách nhau bởi dấu phẩy.
-ADMIN_IDS = [6915752059] # Ví dụ: [6915752059, 123456789]
+ADMIN_IDS = [6915752059] 
 
 DATA_FILE = 'user_data.json'
 CAU_PATTERNS_FILE = 'cau_patterns.json'
@@ -29,14 +27,14 @@ bot = telebot.TeleBot(BOT_TOKEN)
 bot_enabled = True
 bot_disable_reason = "Không có"
 bot_disable_admin_id = None
-prediction_stop_event = Event() # Để kiểm soát luồng dự đoán
-bot_initialized = False # Cờ để đảm bảo bot chỉ được khởi tạo một lần
-bot_init_lock = Lock() # Khóa để tránh race condition khi khởi tạo
+prediction_stop_event = Event() 
+bot_initialized = False 
+bot_init_lock = Lock() 
 
 # Global sets for patterns and codes
 CAU_XAU = set()
 CAU_DEP = set()
-GENERATED_CODES = {} # {code: {"value": 1, "type": "day", "used_by": null, "used_time": null}}
+GENERATED_CODES = {} 
 
 # --- Quản lý dữ liệu người dùng, mẫu cầu và code ---
 user_data = {}
@@ -52,7 +50,7 @@ def load_user_data():
                 print(f"LỖI: Lỗi đọc {DATA_FILE}. Khởi tạo lại dữ liệu người dùng.")
                 user_data = {}
             except Exception as e:
-                print(f"LỖEI: Lỗi không xác định khi tải {DATA_FILE}: {e}")
+                print(f"LỖI: Lỗi không xác định khi tải {DATA_FILE}: {e}")
                 user_data = {}
     else:
         user_data = {}
@@ -159,13 +157,12 @@ def tinh_tai_xiu(dice):
     total = sum(dice)
     return "Tài" if total >= 11 else "Xỉu", total
 
-# New function to generate predictions based on dice values and recent history
 def du_doan_theo_xi_ngau_va_lich_su(dice_list, tx_history):
     # dice_list should be recent dice results (e.g., last 20)
     # tx_history should be 'T' or 'X' for recent results
 
     if not dice_list:
-        return "Đợi thêm dữ liệu"
+        return "Đợi thêm dữ liệu", "Không đủ dữ liệu xúc xắc để dự đoán."
 
     # --- Prediction based on the latest dice ---
     d1, d2, d3 = dice_list[-1]
@@ -174,6 +171,7 @@ def du_doan_theo_xi_ngau_va_lich_su(dice_list, tx_history):
     result_list = []
     for d in [d1, d2, d3]:
         tmp = d + total
+        # Điều chỉnh lại logic tmp nếu cần, giữ theo logic cũ của bạn
         if tmp in [4, 5]:
             tmp -= 4
         elif tmp >= 6:
@@ -183,9 +181,11 @@ def du_doan_theo_xi_ngau_va_lich_su(dice_list, tx_history):
     primary_prediction = max(set(result_list), key=result_list.count)
 
     # --- Enhance prediction using historical patterns (last 20 sessions) ---
-    if len(tx_history) >= 5: # Start considering patterns after at least 5 sessions
-        # Check various lengths of recent patterns
-        for length in range(5, min(len(tx_history) + 1, 21)): # Check patterns from 5 to 20
+    # Start considering patterns after at least 5 sessions for meaningful patterns
+    if len(tx_history) >= 5: 
+        # Check various lengths of recent patterns from 5 up to 20
+        # Iterate from longest pattern to shortest for stronger matches first
+        for length in range(min(len(tx_history), 20), 4, -1): # From min(current_len, 20) down to 5
             current_cau_pattern = ''.join(tx_history[-length:])
             
             if is_cau_dep(current_cau_pattern):
@@ -223,33 +223,29 @@ def is_cau_dep(cau_str):
 # --- Lấy dữ liệu từ API ---
 def lay_du_lieu():
     try:
-        # Changed to a working API endpoint for demonstration purposes.
-        # You should replace this with your actual working API.
-        response = requests.get("https://api.example.com/latest_taixiu_data", timeout=10) 
-        response.raise_for_status() # Báo lỗi nếu status code là lỗi HTTP (4xx, 5xx)
+        # Thay thế bằng URL API THỰC TẾ của bạn
+        # Dựa trên định dạng JSON bạn cung cấp, API của bạn có thể trả về dữ liệu trực tiếp mà không cần đường dẫn phụ
+        response = requests.get("https://1.bot/GetNewLottery/LT_Taixiu", timeout=10) 
+        response.raise_for_status() 
         data = response.json()
         
-        # Mocking API response for demonstration if the actual API is not available
-        # In a real scenario, you would remove this mock.
-        if "example.com" in response.url:
-            print("DEBUG: Using mock API data.")
-            mock_data = {
-                "state": 1,
-                "data": {
-                    "ID": str(int(time.time())), # Unique ID for each call
-                    "Expect": str(random.randint(100000, 999999)), # Random Expect
-                    "OpenCode": ",".join([str(random.randint(1, 6)) for _ in range(3)]) # 3 random dice
-                }
-            }
-            data = mock_data
-            
-        if data.get("state") != 1:
-            print(f"DEBUG: API trả về state không thành công: {data.get('state')} cho {response.url}. Phản hồi đầy đủ: {data}")
+        # Kiểm tra cấu trúc JSON bạn đã cung cấp: {"state":1,"data":{...}}
+        if data.get("state") != 1 or "data" not in data:
+            print(f"DEBUG: API trả về state không thành công hoặc thiếu trường 'data': {data.get('state')} cho {response.url}. Phản hồi đầy đủ: {data}")
             sys.stdout.flush()
             return None
+        
+        actual_data = data.get("data") # Lấy phần 'data' bên trong JSON
+        
+        if not all(k in actual_data for k in ["ID", "Expect", "OpenCode"]):
+            print(f"DEBUG: Dữ liệu API trong trường 'data' không đầy đủ (thiếu ID, Expect, hoặc OpenCode). Dữ liệu: {actual_data}")
+            sys.stdout.flush()
+            return None
+
         print(f"DEBUG: Data fetched from API ({response.url}): {data}")
         sys.stdout.flush()
-        return data.get("data")
+        return actual_data # Trả về phần actual_data để xử lý
+
     except requests.exceptions.Timeout:
         print(f"LỖI: Hết thời gian chờ khi lấy dữ liệu từ API: {response.url}")
         sys.stdout.flush()
@@ -275,8 +271,8 @@ def lay_du_lieu():
 # --- Logic chính của Bot dự đoán (chạy trong luồng riêng) ---
 def prediction_loop(stop_event: Event):
     last_id = None
-    tx_history = [] # Stores 'T' or 'X' for up to 20 sessions
-    dice_history = [] # Stores actual dice tuples for up to 20 sessions
+    tx_history = [] 
+    dice_history = [] 
     
     print("LOG: Luồng dự đoán đã khởi động.")
     sys.stdout.flush()
@@ -285,7 +281,7 @@ def prediction_loop(stop_event: Event):
         if not bot_enabled:
             print(f"LOG: Bot dự đoán đang tạm dừng. Lý do: {bot_disable_reason}")
             sys.stdout.flush()
-            time.sleep(10) # Ngủ lâu hơn khi bot bị tắt
+            time.sleep(10) 
             continue
 
         data = lay_du_lieu()
@@ -295,10 +291,12 @@ def prediction_loop(stop_event: Event):
             time.sleep(5)
             continue
 
+        # Đảm bảo lấy đúng các trường từ `actual_data` đã được trả về từ `lay_du_lieu()`
         issue_id = data.get("ID")
         expect = data.get("Expect")
         open_code = data.get("OpenCode")
 
+        # Kiểm tra lại một lần nữa để đảm bảo dữ liệu cần thiết không bị None
         if not all([issue_id, expect, open_code]):
             print(f"LOG: Dữ liệu API không đầy đủ (thiếu ID, Expect, hoặc OpenCode) cho phiên {expect}. Bỏ qua phiên này. Dữ liệu: {data}")
             sys.stdout.flush()
@@ -308,12 +306,12 @@ def prediction_loop(stop_event: Event):
         if issue_id != last_id:
             try:
                 dice = tuple(map(int, open_code.split(",")))
-                if len(dice) != 3: # Đảm bảo có đúng 3 xúc xắc
+                if len(dice) != 3: 
                     raise ValueError("OpenCode không chứa 3 giá trị xúc xắc.")
             except ValueError as e:
                 print(f"LỖI: Lỗi phân tích OpenCode: '{open_code}'. {e}. Bỏ qua phiên này.")
                 sys.stdout.flush()
-                last_id = issue_id # Vẫn cập nhật last_id để không lặp lại lỗi phiên lỗi này
+                last_id = issue_id 
                 time.sleep(5)
                 continue
             except Exception as e:
@@ -341,11 +339,12 @@ def prediction_loop(stop_event: Event):
             du_doan, ly_do = du_doan_theo_xi_ngau_va_lich_su(dice_history, tx_history)
             
             # --- Dynamic pattern learning based on the actual result ---
-            if len(tx_history) >= 5: # Only update patterns if enough history is available to form a pattern
-                # For pattern learning, consider a range of pattern lengths
-                # Check patterns from 5 to 20 for learning
+            if len(tx_history) >= 5: 
+                # For pattern learning, consider a range of pattern lengths from 5 to 20
                 for length in range(5, min(len(tx_history) + 1, 21)):
                     current_learning_cau = ''.join(tx_history[-length:])
+                    # Logic để xác định prediction_correct cần dùng `du_doan` (dự đoán của bot) 
+                    # và `ket_qua_tx` (kết quả thực tế của phiên vừa qua)
                     prediction_correct = (du_doan == "Tài" and ket_qua_tx == "Tài") or \
                                          (du_doan == "Xỉu" and ket_qua_tx == "Xỉu")
                     update_cau_patterns(current_learning_cau, prediction_correct)
@@ -354,7 +353,7 @@ def prediction_loop(stop_event: Event):
 
 
             # Gửi tin nhắn dự đoán tới tất cả người dùng có quyền truy cập
-            for user_id_str, user_info in list(user_data.items()): # Dùng list() để tránh lỗi khi user_data thay đổi
+            for user_id_str, user_info in list(user_data.items()): 
                 user_id = int(user_id_str)
                 is_sub, sub_message = check_subscription(user_id)
                 if is_sub:
@@ -377,7 +376,6 @@ def prediction_loop(stop_event: Event):
                         if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
                             print(f"CẢNH BÁO: Người dùng {user_id} đã chặn bot hoặc bị vô hiệu hóa. Có thể xem xét xóa khỏi danh sách.")
                             sys.stdout.flush()
-                            # Optional: Uncomment to remove user from user_data if blocked
                             # if user_id_str in user_data:
                             #     del user_data[user_id_str] 
                             #     save_user_data(user_data)
@@ -392,7 +390,7 @@ def prediction_loop(stop_event: Event):
 
             last_id = issue_id
 
-        time.sleep(5) # Đợi 5 giây trước khi kiểm tra phiên mới
+        time.sleep(5) 
     print("LOG: Luồng dự đoán đã dừng.")
     sys.stdout.flush()
 
@@ -415,7 +413,7 @@ def send_welcome(message):
                      "Hãy dùng lệnh /help để xem danh sách các lệnh hỗ trợ.", 
                      parse_mode='Markdown')
     else:
-        user_data[user_id]['username'] = username # Cập nhật username nếu có thay đổi
+        user_data[user_id]['username'] = username 
         save_user_data(user_data)
         bot.reply_to(message, "Bạn đã khởi động bot rồi. Dùng /help để xem các lệnh.")
 
@@ -483,7 +481,7 @@ def send_feedback(message):
         bot.reply_to(message, "Vui lòng nhập nội dung góp ý. Ví dụ: `/gopy Bot dự đoán rất chuẩn!`", parse_mode='Markdown')
         return
     
-    admin_id = ADMIN_IDS[0] # Gửi cho Admin đầu tiên trong danh sách
+    admin_id = ADMIN_IDS[0] 
     user_name = message.from_user.username or message.from_user.first_name
     bot.send_message(admin_id, 
                      f"📢 **GÓP Ý MỚI TỪ NGƯỜI DÙNG** 📢\n\n"
@@ -528,7 +526,7 @@ def start_prediction_command(message):
 
 @bot.message_handler(commands=['maucau'])
 def show_cau_patterns(message):
-    if not is_ctv(message.chat.id): # Chỉ Admin/CTV mới được xem mẫu cầu chi tiết
+    if not is_ctv(message.chat.id): 
         bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
 
@@ -563,17 +561,15 @@ def use_code(message):
         bot.reply_to(message, "❌ Mã code này đã được sử dụng rồi.")
         return
 
-    # Apply extension
     current_expiry_str = user_data.get(user_id, {}).get('expiry_date')
     if current_expiry_str:
         current_expiry_date = datetime.strptime(current_expiry_str, '%Y-%m-%d %H:%M:%S')
-        # If current expiry is in the past, start from now
         if datetime.now() > current_expiry_date:
             new_expiry_date = datetime.now()
         else:
             new_expiry_date = current_expiry_date
     else:
-        new_expiry_date = datetime.now() # Start from now if no previous expiry
+        new_expiry_date = datetime.now() 
 
     value = code_info['value']
     if code_info['type'] == 'ngày':
@@ -644,7 +640,7 @@ def extend_subscription(message):
     
     target_user_id_str = args[0]
     value = int(args[1])
-    unit = args[2].lower() # 'ngày' or 'giờ'
+    unit = args[2].lower() 
     
     if target_user_id_str not in user_data:
         user_data[target_user_id_str] = {
@@ -662,7 +658,7 @@ def extend_subscription(message):
         else:
             new_expiry_date = current_expiry_date
     else:
-        new_expiry_date = datetime.now() # Start from now if no previous expiry
+        new_expiry_date = datetime.now() 
 
     if unit == 'ngày':
         new_expiry_date += timedelta(days=value)
@@ -758,7 +754,7 @@ def send_broadcast(message):
         try:
             bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO TỪ ADMIN** 📢\n\n{broadcast_text}", parse_mode='Markdown')
             success_count += 1
-            time.sleep(0.1) # Tránh bị rate limit
+            time.sleep(0.1) 
         except telebot.apihelper.ApiTelegramException as e:
             print(f"LỖI: Không thể gửi thông báo cho user {user_id_str}: {e}")
             sys.stdout.flush()
@@ -766,14 +762,13 @@ def send_broadcast(message):
             if "bot was blocked by the user" in str(e) or "user is deactivated" in str(e):
                 print(f"CẢNH BÁO: Người dùng {user_id_str} đã chặn bot hoặc bị vô hiệu hóa. Có thể xem xét xóa khỏi user_data.")
                 sys.stdout.flush()
-                # Optional: del user_data[user_id_str] 
         except Exception as e:
             print(f"LỖI: Lỗi không xác định khi gửi thông báo cho user {user_id_str}: {e}")
             sys.stdout.flush()
             fail_count += 1
             
     bot.reply_to(message, f"Đã gửi thông báo đến {success_count} người dùng. Thất bại: {fail_count}.")
-    save_user_data(user_data) # Lưu lại nếu có user bị xóa
+    save_user_data(user_data) 
 
 @bot.message_handler(commands=['tatbot'])
 def disable_bot_command(message):
@@ -793,13 +788,6 @@ def disable_bot_command(message):
     bot.reply_to(message, f"✅ Bot dự đoán đã được tắt bởi Admin `{message.from_user.username or message.from_user.first_name}`.\nLý do: `{reason}`", parse_mode='Markdown')
     sys.stdout.flush()
     
-    # Optionally notify all users
-    # for user_id_str in list(user_data.keys()):
-    #     try:
-    #         bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO QUAN TRỌNG:** Bot dự đoán tạm thời dừng hoạt động.\nLý do: {reason}\nVui lòng chờ thông báo mở lại.", parse_mode='Markdown')
-    #     except Exception:
-    #         pass
-
 @bot.message_handler(commands=['mokbot'])
 def enable_bot_command(message):
     global bot_enabled, bot_disable_reason, bot_disable_admin_id
@@ -817,13 +805,6 @@ def enable_bot_command(message):
     bot.reply_to(message, "✅ Bot dự đoán đã được mở lại bởi Admin.")
     sys.stdout.flush()
     
-    # Optionally notify all users
-    # for user_id_str in list(user_data.keys()):
-    #     try:
-    #         bot.send_message(int(user_id_str), "🎉 **THÔNG BÁO:** Bot dự đoán đã hoạt động trở lại!.", parse_mode='Markdown')
-    #     except Exception:
-    #         pass
-
 @bot.message_handler(commands=['taocode'])
 def generate_code_command(message):
     if not is_admin(message.chat.id):
@@ -831,7 +812,7 @@ def generate_code_command(message):
         return
     
     args = telebot.util.extract_arguments(message.text).split()
-    if len(args) < 2 or len(args) > 3: # Giá trị, đơn vị, số lượng (tùy chọn)
+    if len(args) < 2 or len(args) > 3: 
         bot.reply_to(message, "Cú pháp sai. Ví dụ:\n"
                               "`/taocode <giá_trị> <ngày/giờ> <số_lượng>`\n"
                               "Ví dụ: `/taocode 1 ngày 5` (tạo 5 code 1 ngày)\n"
@@ -841,7 +822,7 @@ def generate_code_command(message):
     try:
         value = int(args[0])
         unit = args[1].lower()
-        quantity = int(args[2]) if len(args) == 3 else 1 # Mặc định tạo 1 code nếu không có số lượng
+        quantity = int(args[2]) if len(args) == 3 else 1 
         
         if unit not in ['ngày', 'giờ']:
             bot.reply_to(message, "Đơn vị không hợp lệ. Chỉ chấp nhận `ngày` hoặc `giờ`.", parse_mode='Markdown')
@@ -852,7 +833,7 @@ def generate_code_command(message):
 
         generated_codes_list = []
         for _ in range(quantity):
-            new_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)) # 8 ký tự ngẫu nhiên
+            new_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8)) 
             GENERATED_CODES[new_code] = {
                 "value": value,
                 "type": unit,
@@ -899,15 +880,14 @@ def start_bot_threads():
 
             # Start prediction loop in a separate thread
             prediction_thread = Thread(target=prediction_loop, args=(prediction_stop_event,))
-            prediction_thread.daemon = True # Đặt daemon = True để luồng tự động kết thúc khi chương trình chính kết thúc
+            prediction_thread.daemon = True 
             prediction_thread.start()
             print("LOG: Luồng dự đoán đã khởi động.")
             sys.stdout.flush()
 
             # Start bot polling in a separate thread
-            # Use bot.infinity_polling() for robust polling
             polling_thread = Thread(target=bot.infinity_polling, kwargs={'none_stop': True})
-            polling_thread.daemon = True # Đặt daemon = True
+            polling_thread.daemon = True 
             polling_thread.start()
             print("LOG: Luồng Telegram bot polling đã khởi động.")
             sys.stdout.flush()
@@ -916,13 +896,7 @@ def start_bot_threads():
 
 # --- Điểm khởi chạy chính cho Gunicorn/Render ---
 if __name__ == '__main__':
-    # Khi chạy cục bộ, Flask sẽ xử lý việc khởi tạo qua app.run()
-    # Khi triển khai trên Render/Heroku với Gunicorn, Gunicorn sẽ gọi Flask app,
-    # và @app.before_request sẽ tự động xử lý việc khởi tạo các luồng.
-    # Không cần gọi app.run() trực tiếp nếu Gunicorn được sử dụng làm điểm khởi đầu chính
     port = int(os.environ.get('PORT', 5000))
     print(f"LOG: Khởi động Flask app trên cổng {port}")
     sys.stdout.flush()
-    # Đặt debug=False khi triển khai thực tế để tăng hiệu suất và bảo mật
-    # debug=True chỉ nên dùng khi phát triển cục bộ để xem lỗi chi tiết trên console
     app.run(host='0.0.0.0', port=port, debug=False)
