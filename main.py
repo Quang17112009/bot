@@ -1,5 +1,3 @@
-# bản gốc chính chủ đây nha các bạn. tele @xwin4
-
 import sqlite3
 import time
 import threading
